@@ -1,25 +1,24 @@
 #!/usr/bin/env python3
 """
-Vapor Bot (Enhanced Version)
-- Keeps Ticket + Role System
-- Adds AI-Generated Embed Descriptions with Emojis
-- Improved Verification Embed with #━━━━⮩VERIFICATION⮨━━━━ Style
+Vapor Bot - Verification Ticket System
+- Verify button creates private tickets
+- Ticket numbering: 1-10^19
+- 1-minute per-user cooldown
+- Ticket owner and admins can close tickets
+- Admins can claim/close/close-with-reason
+- AI-style embeds with emojis
 """
 
 import asyncio
-import json
-import logging
 import os
-import secrets
+import random
+import logging
 from typing import Optional
-
 import discord
-from discord import app_commands, ui
 from discord.ext import commands
+from discord import app_commands, ui
 
-# --- Configuration ---
 BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
-TICKET_CONFIG_FILE = "ticket_config.json"
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -31,30 +30,11 @@ logger = logging.getLogger("vapor-bot")
 
 bot = commands.Bot(command_prefix=None, intents=intents)
 
-
-# --- Persistence Helpers ---
-def load_ticket_config() -> dict:
-    if not os.path.exists(TICKET_CONFIG_FILE):
-        return {}
-    try:
-        with open(TICKET_CONFIG_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        logger.exception("Failed to load ticket config file")
-        return {}
-
-
-def save_ticket_config(config: dict):
-    try:
-        with open(TICKET_CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(config, f, indent=2)
-    except Exception:
-        logger.exception("Failed to save ticket config file")
-
+# --- Cooldown tracking ---
+user_cooldowns = {}
 
 # --- AI-style Embed Generator ---
 def generate_ai_embed(action: str, label: str, target_info: str):
-    """Creates detailed, emoji-filled embeds based on the action type."""
     action = action.lower()
     color = discord.Color.random()
 
@@ -62,149 +42,132 @@ def generate_ai_embed(action: str, label: str, target_info: str):
         title = "🎫 Need Assistance?"
         description = (
             f"Hey there! 👋\n\n"
-            f"If you're facing an issue or have a question, click the **{label}** button below to "
-            f"open a **private support ticket**.\n\n"
-            "🕒 Our team will respond shortly.\n"
-            "💬 Feel free to explain your issue once your ticket opens!"
+            f"Click **{label}** below to open your private **verification ticket**.\n\n"
+            "🕒 Staff will respond shortly!\n💬 Explain your issue clearly."
         )
         color = discord.Color.blue()
-
-    elif action == "role":
-        title = "🎭 Claim Your Role!"
-        description = (
-            f"Ready to stand out? 🌟\n\n"
-            f"Press the **{label}** button below to get your role instantly.\n"
-            "✨ Show off your group and unlock exclusive channels!"
-        )
-        color = discord.Color.green()
-
     elif action == "verify":
         title = "🛡️ Server Verification"
         description = (
-            f"Welcome to the community! 🎉\n\n"
-            f"To access all channels, click the **{label}** button below to verify.\n\n"
-            "📜 Make sure you’ve read the rules before verifying!\n"
-            "🤖 Verification helps us keep this server secure and friendly."
+            f"Welcome! 🎉\n\n"
+            f"Click **{label}** below to create your verification ticket.\n"
+            "📜 Make sure to read the rules first!\n"
+            "🤖 This helps us keep the server secure."
         )
         color = discord.Color.red()
-
+    elif action == "role":
+        title = "🎭 Claim Your Role!"
+        description = (
+            f"Press **{label}** below to get your role instantly.\n"
+            "✨ Unlock exclusive channels!"
+        )
+        color = discord.Color.green()
     else:
         title = "✨ Interactive System"
-        description = f"Click the **{label}** button below to continue."
+        description = f"Click **{label}** to continue."
 
     embed = discord.Embed(title=title, description=description, color=color)
-    embed.set_footer(text=f"Action: {action.capitalize()} | Target: #━━━━⮩VERIFICATION⮨━━━━ | Info: {target_info}")
+    embed.set_footer(text=f"Action: {action.capitalize()} | Target: {target_info}")
     return embed
 
-
-# --- Verification View ---
+# --- Verification Ticket View ---
 class VerificationView(ui.View):
-    def __init__(self, verified_role_name: str = "Verified"):
-        super().__init__(timeout=None)
-        self.verified_role_name = verified_role_name
+    def __init__(self, timeout=None):
+        super().__init__(timeout=timeout)
 
     @ui.button(label="Verify Me", style=discord.ButtonStyle.green, custom_id="verify_button")
-    async def verify_button_callback(self, interaction: discord.Interaction, button: ui.Button):
-        if interaction.guild is None:
-            await interaction.response.send_message("This button only works inside servers.", ephemeral=True)
-            return
+    async def verify(self, interaction: discord.Interaction, button: ui.Button):
+        user_id = interaction.user.id
+        now = asyncio.get_event_loop().time()
 
-        role = discord.utils.get(interaction.guild.roles, name=self.verified_role_name)
-        if role is None:
-            await interaction.response.send_message(f"Error: `{self.verified_role_name}` role does not exist.", ephemeral=True)
-            return
-
-        member = interaction.user if isinstance(interaction.user, discord.Member) else None
-        if member is None:
-            member = interaction.guild.get_member(interaction.user.id)
-        if member is None:
-            await interaction.response.send_message("Could not find your member profile.", ephemeral=True)
-            return
-
-        if role in member.roles:
-            await interaction.response.send_message("✅ You are already verified!", ephemeral=True)
-            return
-
-        try:
-            await member.add_roles(role, reason="User verified")
+        # Per-user cooldown
+        if user_id in user_cooldowns and now - user_cooldowns[user_id] < 60:
             await interaction.response.send_message(
-                f"🛡️ Verification complete! Welcome aboard, {member.mention}! You now have **{self.verified_role_name}** access.",
-                ephemeral=True,
+                "⏱ You must wait 1 minute before creating another ticket.", ephemeral=True
             )
-        except discord.Forbidden:
-            await interaction.response.send_message("❌ Missing permission to assign roles.", ephemeral=True)
-        except Exception as e:
-            logger.exception("Verification role assignment failed: %s", e)
-            await interaction.response.send_message("⚠️ Something went wrong while verifying you.", ephemeral=True)
-
-
-# --- Main Command Upgrades ---
-@bot.tree.command(name="setup_interactive_button", description="Posts a message with a custom button for roles or tickets.")
-@app_commands.describe(
-    action="The action this button should perform (verify, role, or ticket).",
-    label="The text on the button.",
-    role_name="[For Role] The name of the role to assign.",
-    ticket_category="[For Ticket] The category where new ticket channels will be created.",
-    message_content="Optional text to display above the button."
-)
-@commands.has_permissions(administrator=True)
-async def setup_interactive_button(
-    interaction: discord.Interaction,
-    action: str,
-    label: str,
-    role_name: Optional[str] = None,
-    ticket_category: Optional[discord.CategoryChannel] = None,
-    message_content: Optional[str] = None,
-):
-    if interaction.guild is None:
-        await interaction.response.send_message("This command must be used in a server.", ephemeral=True)
-        return
-
-    action = action.lower()
-    custom_id = None
-    target_info = ""
-
-    if action == "role":
-        if not role_name:
-            await interaction.response.send_message("❌ Missing role_name for role action.", ephemeral=True)
             return
-        role = discord.utils.get(interaction.guild.roles, name=role_name)
-        if not role:
-            await interaction.response.send_message(f"❌ Role `{role_name}` not found.", ephemeral=True)
+        user_cooldowns[user_id] = now
+
+        # Category
+        category_name = "━━━━⮩VERIFICATION⮨━━━━"
+        guild = interaction.guild
+        category = discord.utils.get(guild.categories, name=category_name)
+        if category is None:
+            category = await guild.create_category(name=category_name)
+
+        # Ticket name
+        ticket_number = random.randint(1, 10_000_000_000_000_000_000)
+        ticket_name = f"verify-{ticket_number}"
+
+        # Permissions
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_messages=True)
+        }
+        # Admins
+        for member in guild.members:
+            if member.guild_permissions.administrator:
+                overwrites[member] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_messages=True)
+
+        # Create ticket channel
+        ticket_channel = await guild.create_text_channel(name=ticket_name, category=category, overwrites=overwrites)
+
+        # Add buttons (claim/close/close-with-reason)
+        view = TicketActionView(ticket_owner=interaction.user)
+        embed = generate_ai_embed("ticket", "Ticket Actions", ticket_channel.name)
+        await ticket_channel.send(f"{interaction.user.mention} Your verification ticket is created!", embed=embed, view=view)
+        await interaction.response.send_message(f"✅ Your ticket has been created: {ticket_channel.mention}", ephemeral=True)
+
+# --- Ticket Action View ---
+class TicketActionView(ui.View):
+    def __init__(self, ticket_owner: discord.Member, timeout=None):
+        super().__init__(timeout=timeout)
+        self.ticket_owner = ticket_owner
+        self.claimed_by: Optional[discord.Member] = None
+
+    @ui.button(label="Claim Ticket", style=discord.ButtonStyle.blurple, custom_id="claim_ticket")
+    async def claim_ticket(self, interaction: discord.Interaction, button: ui.Button):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("❌ Only admins can claim tickets.", ephemeral=True)
             return
-        custom_id = f"INTERACTIVE_ACTION:ROLE:{role_name}"
-        target_info = f"Role: {role_name}"
+        self.claimed_by = interaction.user
+        await interaction.response.send_message(f"🛡️ Ticket claimed by {interaction.user.mention}", ephemeral=False)
 
-    elif action == "ticket":
-        if ticket_category is None:
-            await interaction.response.send_message("❌ You must select a category for tickets.", ephemeral=True)
+    @ui.button(label="Close Ticket", style=discord.ButtonStyle.red, custom_id="close_ticket")
+    async def close_ticket(self, interaction: discord.Interaction, button: ui.Button):
+        # Ticket can be closed by admin or ticket owner
+        if interaction.user != self.ticket_owner and not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("❌ Only the ticket owner or admin can close this ticket.", ephemeral=True)
             return
-        custom_id = f"INTERACTIVE_ACTION:TICKET:{ticket_category.id}"
-        target_info = f"Category: #{ticket_category.name}"
+        await interaction.response.send_message("❌ Ticket closing...", ephemeral=False)
+        await asyncio.sleep(2)
+        await interaction.channel.delete()
 
-    elif action == "verify":
-        custom_id = "verify_button"
-        target_info = "#━━━━⮩VERIFICATION⮨━━━━"
+    @ui.button(label="Close with Reason", style=discord.ButtonStyle.gray, custom_id="close_reason")
+    async def close_reason(self, interaction: discord.Interaction, button: ui.Button):
+        if interaction.user != self.ticket_owner and not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("❌ Only the ticket owner or admin can close this ticket.", ephemeral=True)
+            return
 
-    else:
-        await interaction.response.send_message("❌ Invalid action. Use `verify`, `role`, or `ticket`.", ephemeral=True)
-        return
+        modal = CloseReasonModal(ticket_channel=interaction.channel)
+        await interaction.response.send_modal(modal)
 
-    view = ui.View(timeout=None)
-    view.add_item(ui.Button(label=label, style=discord.ButtonStyle.primary, custom_id=custom_id))
+# --- Close Reason Modal ---
+class CloseReasonModal(ui.Modal, title="Close Ticket with Reason"):
+    reason = ui.TextInput(label="Reason for closing", style=discord.TextStyle.paragraph)
 
-    # AI-styled embed creation
-    embed = generate_ai_embed(action, label, target_info)
+    def __init__(self, ticket_channel: discord.TextChannel):
+        super().__init__()
+        self.ticket_channel = ticket_channel
 
-    bot.add_view(view)
-    try:
-        await interaction.response.send_message(embed=embed, view=view)
-    except discord.Forbidden:
-        await interaction.response.send_message("I don't have permission to send embeds here.", ephemeral=True)
+    async def on_submit(self, interaction: discord.Interaction):
+        await self.ticket_channel.send(f"📝 Ticket closed with reason: {self.reason.value}")
+        await interaction.response.send_message("✅ Ticket will be closed shortly.", ephemeral=True)
+        await asyncio.sleep(2)
+        await self.ticket_channel.delete()
 
-
-# --- Verification Setup Command ---
-@bot.tree.command(name="setup_verify", description="Posts the verification message with the fancy AI embed.")
+# --- Setup Commands ---
+@bot.tree.command(name="setup_verify", description="Posts verification button with AI embed.")
 @commands.has_permissions(administrator=True)
 async def setup_verify(interaction: discord.Interaction):
     embed = generate_ai_embed("verify", "Verify Me", "#━━━━⮩VERIFICATION⮨━━━━")
@@ -212,19 +175,16 @@ async def setup_verify(interaction: discord.Interaction):
     bot.add_view(view)
     await interaction.response.send_message(embed=embed, view=view)
 
-
-# --- Startup Logic ---
+# --- Startup ---
 @bot.event
 async def on_ready():
     logger.info(f"✅ Logged in as {bot.user} (id: {bot.user.id})")
     bot.add_view(VerificationView())
-    logger.info("✅ VerificationView registered.")
     try:
         synced = await bot.tree.sync()
         logger.info(f"Synced {len(synced)} commands successfully.")
     except Exception as e:
         logger.exception("Failed to sync commands: %s", e)
-
 
 if __name__ == "__main__":
     if not BOT_TOKEN:
