@@ -146,7 +146,7 @@ class VerificationView(ui.View):
 
 
 class PostMessageModal(ui.Modal, title="Create Custom Post"):
-    """Modal that collects embed title, message, and optional link buttons."""
+    """Modal that collects embed title, message, optional link buttons, image URL, and footer text."""
 
     embed_title = ui.TextInput(
         label="Embed Title (Optional)",
@@ -156,16 +156,43 @@ class PostMessageModal(ui.Modal, title="Create Custom Post"):
         max_length=256,
     )
 
+    # ADDED: Default text for faster posting
     message_content = ui.TextInput(
         label="Message/Embed Description",
         style=discord.TextStyle.long,
         placeholder="Enter the main text content here...",
         required=True,
         max_length=2000,
+        default="📢 We have an exciting announcement! Read the details below to find out more."
+    )
+    
+    # New field for color
+    embed_color = ui.TextInput(
+        label="Embed Color (Optional, Hex Code)",
+        style=discord.TextStyle.short,
+        placeholder="Example: #FF5733 (defaults to Blue)",
+        required=False,
+        max_length=7,
+    )
+    
+    image_url = ui.TextInput(
+        label="Image URL (Optional)",
+        style=discord.TextStyle.short,
+        placeholder="Paste a link to an image (must start with http/https)...",
+        required=False,
+        max_length=200,
+    )
+    
+    footer_text = ui.TextInput(
+        label="Footer Text (Optional)",
+        style=discord.TextStyle.short,
+        placeholder="Enter text for the bottom of the embed...",
+        required=False,
+        max_length=2048,
     )
 
     button_data = ui.TextInput(
-        label="Buttons (Label|URL, Label|URL)",
+        label="Link Buttons (Label|URL, Label|URL)",
         style=discord.TextStyle.short,
         placeholder="Example: Website|https://example.com, Discord|https://discord.gg/invite",
         required=False,
@@ -180,11 +207,55 @@ class PostMessageModal(ui.Modal, title="Create Custom Post"):
             )
             return
 
-        # Build embed
+        # --- 1. Parse Color ---
+        color_input = self.embed_color.value.strip() if self.embed_color.value else None
+        embed_color = discord.Color.blue() # Default color
+        color_warning = ""
+
+        if color_input:
+            hex_code = color_input.lstrip('#')
+            if len(hex_code) == 6:
+                try:
+                    # Convert hex string to integer and create Color object
+                    embed_color = discord.Color(int(hex_code, 16))
+                except ValueError:
+                    color_warning = "⚠️ Warning: Invalid hex code provided for color. Using default blue."
+            else:
+                color_warning = "⚠️ Warning: Color must be a 6-digit hex code (e.g., #FF5733). Using default blue."
+        
+        # --- 2. Build Embed ---
         title = self.embed_title.value.strip() if self.embed_title.value else None
         description = self.message_content.value.strip()
-        embed = discord.Embed(title=title if title else None, description=description, color=discord.Color.blue())
+        
+        # ADDED: Auto-add Emojis
+        if title:
+            # Add emoji to title
+            title = "✨ " + title
+        else:
+            # If no title, add emoji to description start
+            description = "🌟 " + description
+        
+        # Create embed with parsed color
+        embed = discord.Embed(title=title if title else None, description=description, color=embed_color)
+        
+        # Automatically add timestamp for a modern look
+        embed.timestamp = discord.utils.utcnow()
 
+        # Process Image URL
+        image_url = self.image_url.value.strip() if self.image_url.value else None
+        if image_url:
+            if not image_url.lower().startswith(("http://", "https://")):
+                await interaction.response.send_message(
+                    "❌ Error: Image URL must start with http:// or https://", ephemeral=True
+                )
+                return
+            embed.set_image(url=image_url)
+
+        # Process Footer Text
+        footer_text = self.footer_text.value.strip() if self.footer_text.value else None
+        if footer_text:
+            embed.set_footer(text=footer_text)
+            
         # Parse buttons
         view = ui.View()
         button_str = self.button_data.value.strip() if self.button_data.value else ""
@@ -212,7 +283,7 @@ class PostMessageModal(ui.Modal, title="Create Custom Post"):
                 # Add a Link button
                 view.add_item(ui.Button(label=label, url=url))
 
-        # Send embed to the channel
+        # --- 3. Send embed to the channel ---
         try:
             await interaction.channel.send(embed=embed, view=view if len(view.children) > 0 else None)
         except discord.Forbidden:
@@ -232,11 +303,94 @@ class PostMessageModal(ui.Modal, title="Create Custom Post"):
                 logger.exception("Failed to send followup error for post_message")
             return
 
-        # Acknowledge the user
+        # --- 4. Acknowledge the user (Success or Success with Warning) ---
         try:
-            await interaction.response.send_message("✅ Your custom message has been posted!", ephemeral=True)
+            acknowledgement = "✅ Your custom message has been posted!"
+            if color_warning:
+                acknowledgement = f"{acknowledgement}\n{color_warning}"
+                
+            await interaction.response.send_message(acknowledgement, ephemeral=True)
         except Exception:
             logger.exception("Failed to acknowledge modal submit")
+
+
+# --- Dynamic Interactive Button System ---
+
+class InteractiveButtonView(ui.View):
+    """
+    A persistent view that handles dynamic button clicks for actions like 
+    assigning roles or opening the ticket modal, based on the custom_id.
+    """
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    # Use a placeholder button definition to ensure the view registers for persistence
+    # The actual posted button will have a different custom_id, but the handler catches it.
+    @ui.button(label="Action Button", style=discord.ButtonStyle.secondary, custom_id="INTERACTIVE_ACTION_PLACEHOLDER")
+    async def handle_dynamic_action(self, interaction: discord.Interaction, button: ui.Button):
+        parts = button.custom_id.split(":")
+        
+        if len(parts) < 3 or parts[0] != "INTERACTIVE_ACTION":
+            return await interaction.response.send_message("Error: Invalid button configuration.", ephemeral=True)
+
+        action_type = parts[1]
+        target_value = ":".join(parts[2:]) # Handles role names that might contain ':'
+        
+        if action_type == "TICKET":
+            # Respond immediately with the modal (no defer)
+            try:
+                category_id = int(target_value)
+            except ValueError:
+                return await interaction.response.send_message("Error: Ticket category ID is invalid.", ephemeral=True)
+                 
+            try:
+                # Respond directly with the modal
+                return await interaction.response.send_modal(TicketModal(category_id=category_id))
+            except Exception:
+                logger.exception("Failed to open TicketModal from dynamic button")
+                return await interaction.response.send_message("Failed to open ticket creation form.", ephemeral=True)
+
+        # For all other actions (like ROLE), defer first as they require more time
+        await interaction.response.defer(ephemeral=True)
+
+        if interaction.guild is None:
+            await interaction.followup.send("This action can only be used in a server.", ephemeral=True)
+            return
+
+        if action_type == "ROLE":
+            role_name = target_value
+            role = discord.utils.get(interaction.guild.roles, name=role_name)
+            member = interaction.user
+            
+            if role is None:
+                return await interaction.followup.send(f"Error: Role `{role_name}` not found. Contact an admin.", ephemeral=True)
+
+            if not isinstance(member, discord.Member):
+                # Ensure we have a Member object
+                member = interaction.guild.get_member(interaction.user.id)
+                if member is None:
+                    return await interaction.followup.send("Could not resolve your member object.", ephemeral=True)
+
+            if role in member.roles:
+                return await interaction.followup.send(f"You already have the **{role_name}** role.", ephemeral=True)
+
+            me = interaction.guild.me
+            if role.position >= me.top_role.position or not me.guild_permissions.manage_roles:
+                return await interaction.followup.send(
+                    "The bot cannot assign that role due to permission hierarchy.", ephemeral=True
+                )
+
+            try:
+                await member.add_roles(role, reason="Dynamic role button click")
+                await interaction.followup.send(
+                    f"You have been granted the **{role_name}** role! 🎉", ephemeral=True
+                )
+            except Exception:
+                logger.exception("Failed to assign role from dynamic button")
+                await interaction.followup.send("Failed to assign role due to an unexpected error.", ephemeral=True)
+        
+        else:
+            await interaction.followup.send("Error: Unknown button action type.", ephemeral=True)
 
 
 # --- Ticketing System Components ---
@@ -465,10 +619,11 @@ async def on_ready():
     # Register persistent views
     # VerificationView uses a static custom_id, so one instance is enough.
     bot.add_view(VerificationView())
-    
     # TicketPanelView uses a dynamic custom_id (TICKET_CREATE:{id}), so we register the class 
     # to handle any button starting with the class's default custom_id prefix.
     bot.add_view(TicketPanelView())
+    # ADDED: Register the dynamic interactive button view
+    bot.add_view(InteractiveButtonView())
     
     # Global sync for all commands (this is slow, but necessary for first time global deployment)
     try:
@@ -505,7 +660,7 @@ async def setup_verify(interaction: discord.Interaction):
         )
 
 
-@bot.tree.command(name="post_message", description="Posts a custom embed and optional link buttons.")
+@bot.tree.command(name="post_message", description="Posts a custom embed and optional link buttons (Auto-fills content).")
 @commands.has_permissions(manage_messages=True)
 async def post_message_command(interaction: discord.Interaction):
     """Opens a modal asking for embed/message details and optional buttons."""
@@ -517,6 +672,98 @@ async def post_message_command(interaction: discord.Interaction):
             await interaction.response.send_message(f"Could not open the modal.", ephemeral=True)
         except Exception:
             logger.exception("Failed to send modal error response")
+
+
+# ADDED: New command for dynamic, interactive buttons
+@bot.tree.command(name="setup_interactive_button", description="Posts a message with a custom button for roles or tickets.")
+@app_commands.describe(
+    action="The action this button should perform (role or ticket).",
+    label="The text on the button.",
+    role_name="[Required for Role] The name of the role to assign (e.g., Member).",
+    ticket_category="[Required for Ticket] The category where new ticket channels will be created.",
+    message_content="Optional text to display above the button."
+)
+@commands.has_permissions(administrator=True)
+async def setup_interactive_button(
+    interaction: discord.Interaction,
+    action: str, 
+    label: str,
+    role_name: Optional[str] = None,
+    ticket_category: Optional[discord.CategoryChannel] = None,
+    message_content: Optional[str] = None,
+):
+    """Command for admins to post a message with a custom button that assigns a role or creates a ticket."""
+    if interaction.guild is None:
+        await interaction.response.send_message("This command can only be used inside a server.", ephemeral=True)
+        return
+        
+    action = action.lower()
+    custom_id = None
+    target_info = ""
+    
+    if action == "role":
+        if not role_name:
+            await interaction.response.send_message("❌ When action is `role`, the `role_name` argument is required.", ephemeral=True)
+            return
+        role = discord.utils.get(interaction.guild.roles, name=role_name)
+        if role is None:
+            await interaction.response.send_message(f"❌ Role named `{role_name}` not found in this server.", ephemeral=True)
+            return
+        # Custom ID format: INTERACTIVE_ACTION:ROLE:Role Name
+        custom_id = f"INTERACTIVE_ACTION:ROLE:{role_name}"
+        target_info = f"Role: {role_name}"
+        style = discord.ButtonStyle.green
+        embed_title = "Dynamic Role Assignment"
+
+    elif action == "ticket":
+        if not ticket_category:
+            await interaction.response.send_message("❌ When action is `ticket`, the `ticket_category` argument is required.", ephemeral=True)
+            return
+        
+        # Check permissions for bot to create channels in that category
+        me = interaction.guild.me
+        if not me:
+            await interaction.response.send_message("Bot member object unavailable.", ephemeral=True)
+            return
+        category_perms = ticket_category.permissions_for(me)
+        if not category_perms.manage_channels:
+            await interaction.response.send_message(
+                "❌ I must have the **Manage Channels** permission in that category to create tickets there.", ephemeral=True
+            )
+            return
+            
+        # Custom ID format: INTERACTIVE_ACTION:TICKET:Category ID
+        custom_id = f"INTERACTIVE_ACTION:TICKET:{ticket_category.id}"
+        target_info = f"Category: #{ticket_category.name}"
+        style = discord.ButtonStyle.primary
+        embed_title = "Dynamic Ticket System"
+
+    else:
+        await interaction.response.send_message("❌ Invalid action type. Must be `role` or `ticket`.", ephemeral=True)
+        return
+
+    # Create a temporary view to send the message with the specific, dynamic button
+    view = ui.View(timeout=None)
+    action_button = ui.Button(label=label, style=style, custom_id=custom_id)
+    view.add_item(action_button)
+    
+    content = message_content or (
+        f"Click the **{label}** button below to complete the action. This button performs: {action.capitalize()}."
+    )
+    
+    embed = discord.Embed(
+        title=embed_title,
+        description=content,
+        color=style.color,
+    )
+    embed.set_footer(text=f"Action: {action.capitalize()} | Target: {target_info}")
+
+    try:
+        await interaction.response.send_message(embed=embed, view=view)
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            "I do not have permission to send messages in this channel.", ephemeral=True
+        )
 
 
 @bot.tree.command(name="setup_ticket", description="Posts the ticket creation panel.")
