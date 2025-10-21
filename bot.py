@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Vapor Bot - Full Verification & Interactive Ticket System
-- Old /setup_interactive_button style
-- Verify button creates private tickets with 1-min cooldown
+Vapor Bot - Verification Ticket System
+- Verify button creates private tickets
+- Ticket numbering: 1-10^19
+- 1-minute per-user cooldown
 - Ticket owner and admins can close tickets
 - Admins can claim/close/close-with-reason
 - AI-style embeds with emojis
@@ -29,24 +30,37 @@ logger = logging.getLogger("vapor-bot")
 
 bot = commands.Bot(command_prefix=None, intents=intents)
 
-# --- Per-user cooldowns ---
+# --- Cooldown tracking ---
 user_cooldowns = {}
 
 # --- AI-style Embed Generator ---
 def generate_ai_embed(action: str, label: str, target_info: str):
     action = action.lower()
     color = discord.Color.random()
+
     if action == "ticket":
         title = "🎫 Need Assistance?"
-        description = f"Hey there! 👋\n\nClick **{label}** below to open your private **verification ticket**.\n🕒 Staff will respond shortly!\n💬 Explain your issue clearly."
+        description = (
+            f"Hey there! 👋\n\n"
+            f"Click **{label}** below to open your private **verification ticket**.\n\n"
+            "🕒 Staff will respond shortly!\n💬 Explain your issue clearly."
+        )
         color = discord.Color.blue()
     elif action == "verify":
         title = "🛡️ Server Verification"
-        description = f"Welcome! 🎉\n\nClick **{label}** to create your verification ticket.\n📜 Read the rules first!\n🤖 This keeps the server secure."
+        description = (
+            f"Welcome! 🎉\n\n"
+            f"Click **{label}** below to create your verification ticket.\n"
+            "📜 Make sure to read the rules first!\n"
+            "🤖 This helps us keep the server secure."
+        )
         color = discord.Color.red()
     elif action == "role":
         title = "🎭 Claim Your Role!"
-        description = f"Press **{label}** below to get your role instantly.\n✨ Unlock exclusive channels!"
+        description = (
+            f"Press **{label}** below to get your role instantly.\n"
+            "✨ Unlock exclusive channels!"
+        )
         color = discord.Color.green()
     else:
         title = "✨ Interactive System"
@@ -66,7 +80,7 @@ class VerificationView(ui.View):
         user_id = interaction.user.id
         now = asyncio.get_event_loop().time()
 
-        # Cooldown
+        # Per-user cooldown
         if user_id in user_cooldowns and now - user_cooldowns[user_id] < 60:
             await interaction.response.send_message(
                 "⏱ You must wait 1 minute before creating another ticket.", ephemeral=True
@@ -74,21 +88,18 @@ class VerificationView(ui.View):
             return
         user_cooldowns[user_id] = now
 
-        guild = interaction.guild
-        if guild is None:
-            await interaction.response.send_message("❌ Must be used in a server.", ephemeral=True)
-            return
-
         # Category
         category_name = "━━━━⮩VERIFICATION⮨━━━━"
+        guild = interaction.guild
         category = discord.utils.get(guild.categories, name=category_name)
         if category is None:
             category = await guild.create_category(name=category_name)
 
-        # Ticket channel
+        # Ticket name
         ticket_number = random.randint(1, 10_000_000_000_000_000_000)
         ticket_name = f"verify-{ticket_number}"
 
+        # Permissions
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(view_channel=False),
             interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_messages=True)
@@ -98,8 +109,10 @@ class VerificationView(ui.View):
             if member.guild_permissions.administrator:
                 overwrites[member] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_messages=True)
 
+        # Create ticket channel
         ticket_channel = await guild.create_text_channel(name=ticket_name, category=category, overwrites=overwrites)
 
+        # Add buttons (claim/close/close-with-reason)
         view = TicketActionView(ticket_owner=interaction.user)
         embed = generate_ai_embed("ticket", "Ticket Actions", ticket_channel.name)
         await ticket_channel.send(f"{interaction.user.mention} Your verification ticket is created!", embed=embed, view=view)
@@ -122,6 +135,7 @@ class TicketActionView(ui.View):
 
     @ui.button(label="Close Ticket", style=discord.ButtonStyle.red, custom_id="close_ticket")
     async def close_ticket(self, interaction: discord.Interaction, button: ui.Button):
+        # Ticket can be closed by admin or ticket owner
         if interaction.user != self.ticket_owner and not interaction.user.guild_permissions.administrator:
             await interaction.response.send_message("❌ Only the ticket owner or admin can close this ticket.", ephemeral=True)
             return
@@ -134,6 +148,7 @@ class TicketActionView(ui.View):
         if interaction.user != self.ticket_owner and not interaction.user.guild_permissions.administrator:
             await interaction.response.send_message("❌ Only the ticket owner or admin can close this ticket.", ephemeral=True)
             return
+
         modal = CloseReasonModal(ticket_channel=interaction.channel)
         await interaction.response.send_modal(modal)
 
@@ -151,42 +166,30 @@ class CloseReasonModal(ui.Modal, title="Close Ticket with Reason"):
         await asyncio.sleep(2)
         await self.ticket_channel.delete()
 
-# --- Old /setup_interactive_button ---
-@bot.tree.command(name="setup_interactive_button", description="Posts a message with a custom button for roles or tickets.")
-@app_commands.describe(
-    action="Action: verify, role, ticket",
-    label="Button text",
-    role_name="[Role] Name",
-    ticket_category="[Ticket] Category",
-    message_content="Optional text above button"
-)
+# --- Setup Commands ---
+@bot.command(name="setup_verify")
 @commands.has_permissions(administrator=True)
-async def setup_interactive_button(interaction: discord.Interaction, action: str, label: str,
-                                   role_name: Optional[str] = None, ticket_category: Optional[discord.CategoryChannel] = None,
-                                   message_content: Optional[str] = None):
-    guild = interaction.guild
-    if guild is None:
-        await interaction.response.send_message("❌ Must be run in a server.", ephemeral=True)
-        return
+async def setup_verify(ctx: commands.Context):
+    """Posts verification button with AI embed."""
+    embed = generate_ai_embed("verify", "Verify Me", "#━━━━⮩VERIFICATION⮨━━━━")
+    view = VerificationView()
+    bot.add_view(view)
+    await ctx.send(embed=embed, view=view)
 
-    action = action.lower()
-    custom_id = None
-    target_info = ""
+# --- Startup ---
+@bot.event
+async def on_ready():
+    logger.info(f"✅ Logged in as {bot.user} (id: {bot.user.id})")
+    bot.add_view(VerificationView())
+    try:
+        await bot.tree.sync()
+        logger.info("✅ Commands synced successfully.")
+    except Exception as e:
+        logger.exception("Failed to sync commands: %s", e)
 
-    if action == "role":
-        if not role_name:
-            await interaction.response.send_message("❌ Missing role_name.", ephemeral=True)
-            return
-        role = discord.utils.get(guild.roles, name=role_name)
-        if not role:
-            await interaction.response.send_message(f"❌ Role `{role_name}` not found.", ephemeral=True)
-            return
-        custom_id = f"INTERACTIVE_ACTION:ROLE:{role_name}"
-        target_info = f"Role: {role_name}"
-    elif action == "ticket":
-        if ticket_category is None:
-            await interaction.response.send_message("❌ Must select a category.", ephemeral=True)
-            return
-        custom_id = f"INTERACTIVE_ACTION:TICKET:{ticket_category.id}"
-        target_info = f"Category: #{ticket_category.name}"
-    elif action == "verify":
+if __name__ == "__main__":
+    if not BOT_TOKEN:
+        logger.error("❌ DISCORD_BOT_TOKEN not set in environment.")
+        print("Set DISCORD_BOT_TOKEN in your hosting environment.")
+    else:
+        bot.run(BOT_TOKEN)
