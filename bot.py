@@ -1,3 +1,15 @@
+#!/usr/bin/env python3
+"""
+Unified bot.py: single-file Discord bot with:
+- Verification button (persistent)
+- Post message modal (embed builder)
+- Interactive dynamic buttons (role assign or ticket creation)
+- Ticket panel with persistent TICKET_CREATE:{category_id} custom_id handling
+- Persistence for ticket panel mappings (ticket_config.json)
+- Proper runtime registration of sent view instances and re-registration on startup
+- Helpful guidance when required slash options are missing
+"""
+
 import asyncio
 import json
 import logging
@@ -9,9 +21,9 @@ import discord
 from discord import app_commands, ui
 from discord.ext import commands
 
-# --- Configuration (DO NOT CHECK IN A REAL TOKEN) ---
-BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "YOUR_BOT_TOKEN")
-TICKET_CONFIG_FILE = "ticket_config.json"  # simple persistence for category IDs per guild
+# --- Configuration ---
+BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")  # Set this in Railway variables
+TICKET_CONFIG_FILE = "ticket_config.json"  # persisted mapping: { "<guild_id>": <category_id> }
 
 # Required intents
 intents = discord.Intents.default()
@@ -26,13 +38,12 @@ logger = logging.getLogger("vapor-bot")
 bot = commands.Bot(command_prefix=None, intents=intents)
 
 
-# Simple helper to persist ticket category mappings {guild_id: category_id}
-def load_ticket_config():
+# --- Persistence helpers ---
+def load_ticket_config() -> dict:
     if not os.path.exists(TICKET_CONFIG_FILE):
         return {}
     try:
         with open(TICKET_CONFIG_FILE, "r", encoding="utf-8") as f:
-            # Keys in JSON will be strings, so we ensure they are parsed as such
             return json.load(f)
     except Exception:
         logger.exception("Failed to load ticket config file")
@@ -47,27 +58,20 @@ def save_ticket_config(config: dict):
         logger.exception("Failed to save ticket config file")
 
 
-# --- 1. Custom Button View (for Verification) ---
-
-
+# --- 1) Verification View ---
 class VerificationView(ui.View):
-    """A persistent view with a Verify button that adds a role to the clicking user."""
+    """Persistent Verify button that grants a role to the clicking user."""
 
-    # Note: custom_id is static, so one instance registration is enough for persistence.
     def __init__(self, verified_role_name: str = "Verified"):
         super().__init__(timeout=None)
         self.verified_role_name = verified_role_name
 
     @ui.button(label="Verify Me", style=discord.ButtonStyle.green, custom_id="verify_button")
     async def verify_button_callback(self, interaction: discord.Interaction, button: ui.Button):
-        # Ensure this interaction happened in a guild
         if interaction.guild is None:
-            await interaction.response.send_message(
-                "This verification button can only be used inside servers.", ephemeral=True
-            )
+            await interaction.response.send_message("This verification button only works inside servers.", ephemeral=True)
             return
 
-        # Resolve role
         role = discord.utils.get(interaction.guild.roles, name=self.verified_role_name)
         if role is None:
             await interaction.response.send_message(
@@ -75,12 +79,11 @@ class VerificationView(ui.View):
             )
             return
 
-        # Resolve member object (interaction.user can be a Member or a User)
+        # Resolve member
         member: Optional[discord.Member] = None
         if isinstance(interaction.user, discord.Member):
             member = interaction.user
         else:
-            # Try to get from cache then fallback to fetch
             member = interaction.guild.get_member(interaction.user.id)
             if member is None:
                 try:
@@ -89,284 +92,188 @@ class VerificationView(ui.View):
                     member = None
 
         if member is None:
-            await interaction.response.send_message(
-                "Could not resolve your member object. Try again or contact an admin.", ephemeral=True
-            )
+            await interaction.response.send_message("Could not resolve your member object. Try again later.", ephemeral=True)
             return
 
-        # Permission checks for the bot before trying to add roles
         me = interaction.guild.me or interaction.guild.get_member(bot.user.id)
         if me is None:
-            await interaction.response.send_message(
-                "Bot member object unavailable; cannot assign roles.", ephemeral=True
-            )
+            await interaction.response.send_message("Bot member object unavailable; cannot assign roles.", ephemeral=True)
             return
 
         if not me.guild_permissions.manage_roles:
-            await interaction.response.send_message(
-                "I do not have the Manage Roles permission. Ask an admin to grant it to me.", ephemeral=True
-            )
+            await interaction.response.send_message("I do not have Manage Roles permission. Ask an admin to grant it.", ephemeral=True)
             return
 
-        # Ensure the bot's top role is above the target role
         if role.position >= me.top_role.position:
             await interaction.response.send_message(
-                "I cannot assign that role because it is higher or equal to my top role. An admin must fix role ordering.",
+                "I cannot assign that role because it is higher or equal to my top role. An admin must adjust role order.",
                 ephemeral=True,
             )
             return
 
-        # Add the role if the user doesn't already have it
         if role in member.roles:
             await interaction.response.send_message("You are already verified!", ephemeral=True)
             return
 
         try:
             await member.add_roles(role, reason="Self-verification via verify button")
-            await interaction.response.send_message(
-                f"Verification successful! You now have the **{self.verified_role_name}** role.",
-                ephemeral=True,
-            )
+            await interaction.response.send_message(f"Verification successful! You now have **{self.verified_role_name}**.", ephemeral=True)
         except discord.Forbidden:
-            await interaction.response.send_message(
-                "I lack permissions to add that role. Please contact an administrator.", ephemeral=True
-            )
-        except Exception as e:
+            await interaction.response.send_message("I lack permissions to add that role. Please contact an admin.", ephemeral=True)
+        except Exception:
             logger.exception("Failed to add verification role")
-            # Best-effort response
             try:
-                await interaction.response.send_message(
-                    f"An unexpected error occurred while assigning the role: {e}", ephemeral=True
-                )
+                await interaction.response.send_message("An unexpected error occurred while assigning the role.", ephemeral=True)
             except Exception:
-                logger.exception("Failed to send error response for verification failure")
+                logger.exception("Failed to acknowledgement verification error")
 
 
-# --- 2. Custom Modal (for Post Message Command) ---
-
-
+# --- 2) Post Message Modal ---
 class PostMessageModal(ui.Modal, title="Create Custom Post"):
-    """Modal that collects embed title, message, optional link buttons, image URL, and footer text."""
-
-    embed_title = ui.TextInput(
-        label="Embed Title (Optional)",
-        style=discord.TextStyle.short,
-        placeholder="Enter a title for the embed...",
-        required=False,
-        max_length=256,
-    )
-
-    # ADDED: Default text for faster posting
+    embed_title = ui.TextInput(label="Embed Title (Optional)", style=discord.TextStyle.short, required=False, max_length=256)
     message_content = ui.TextInput(
         label="Message/Embed Description",
         style=discord.TextStyle.long,
-        placeholder="Enter the main text content here...",
         required=True,
         max_length=2000,
         default="📢 We have an exciting announcement! Read the details below to find out more."
     )
-    
-    # New field for color
-    embed_color = ui.TextInput(
-        label="Embed Color (Optional, Hex Code)",
-        style=discord.TextStyle.short,
-        placeholder="Example: #FF5733 (defaults to Blue)",
-        required=False,
-        max_length=7,
-    )
-    
-    image_url = ui.TextInput(
-        label="Image URL (Optional)",
-        style=discord.TextStyle.short,
-        placeholder="Paste a link to an image (must start with http/https)...",
-        required=False,
-        max_length=200,
-    )
-    
-    footer_text = ui.TextInput(
-        label="Footer Text (Optional)",
-        style=discord.TextStyle.short,
-        placeholder="Enter text for the bottom of the embed...",
-        required=False,
-        max_length=2048,
-    )
-
+    embed_color = ui.TextInput(label="Embed Color (Optional, Hex Code)", style=discord.TextStyle.short, required=False, max_length=7)
+    image_url = ui.TextInput(label="Image URL (Optional)", style=discord.TextStyle.short, required=False, max_length=200)
+    footer_text = ui.TextInput(label="Footer Text (Optional)", style=discord.TextStyle.short, required=False, max_length=2048)
     button_data = ui.TextInput(
         label="Link Buttons (Label|URL, Label|URL)",
         style=discord.TextStyle.short,
-        placeholder="Example: Website|https://example.com, Discord|https://discord.gg/invite",
         required=False,
         max_length=1000,
+        placeholder="Website|https://example.com, Support|https://example.com/support"
     )
 
     async def on_submit(self, interaction: discord.Interaction):
-        # Ensure the modal submission happened in a guild text channel (channel may be None in DM)
         if interaction.channel is None:
-            await interaction.response.send_message(
-                "Cannot post to the channel because the interaction has no channel context.", ephemeral=True
-            )
+            await interaction.response.send_message("Cannot post because the interaction has no channel context.", ephemeral=True)
             return
 
-        # --- 1. Parse Color ---
+        # Parse color
         color_input = self.embed_color.value.strip() if self.embed_color.value else None
-        embed_color = discord.Color.blue() # Default color
+        embed_color = discord.Color.blue()
         color_warning = ""
-
         if color_input:
-            hex_code = color_input.lstrip('#')
+            hex_code = color_input.lstrip("#")
             if len(hex_code) == 6:
                 try:
-                    # Convert hex string to integer and create Color object
                     embed_color = discord.Color(int(hex_code, 16))
                 except ValueError:
-                    color_warning = "⚠️ Warning: Invalid hex code provided for color. Using default blue."
+                    color_warning = "⚠️ Invalid hex code provided. Using default blue."
             else:
-                color_warning = "⚠️ Warning: Color must be a 6-digit hex code (e.g., #FF5733). Using default blue."
-        
-        # --- 2. Build Embed ---
+                color_warning = "⚠️ Color must be a 6-digit hex code (e.g., #FF5733). Using default blue."
+
         title = self.embed_title.value.strip() if self.embed_title.value else None
         description = self.message_content.value.strip()
-        
-        # ADDED: Auto-add Emojis
         if title:
-            # Add emoji to title
             title = "✨ " + title
         else:
-            # If no title, add emoji to description start
             description = "🌟 " + description
-        
-        # Create embed with parsed color
-        embed = discord.Embed(title=title if title else None, description=description, color=embed_color)
-        
-        # Automatically add timestamp for a modern look
-        embed.timestamp = discord.utils.utcnow()
 
-        # Process Image URL
+        embed = discord.Embed(title=title if title else None, description=description, color=embed_color)
+        embed.timestamp = discord.utils.utcnow()
         image_url = self.image_url.value.strip() if self.image_url.value else None
         if image_url:
             if not image_url.lower().startswith(("http://", "https://")):
-                await interaction.response.send_message(
-                    "❌ Error: Image URL must start with http:// or https://", ephemeral=True
-                )
+                await interaction.response.send_message("❌ Image URL must start with http:// or https://", ephemeral=True)
                 return
             embed.set_image(url=image_url)
 
-        # Process Footer Text
         footer_text = self.footer_text.value.strip() if self.footer_text.value else None
         if footer_text:
             embed.set_footer(text=footer_text)
-            
-        # Parse buttons
+
         view = ui.View()
         button_str = self.button_data.value.strip() if self.button_data.value else ""
         if button_str:
-            # Accept label|url pairs separated by commas
             pairs = [p.strip() for p in button_str.split(",") if p.strip()]
             for pair in pairs:
                 if "|" not in pair:
-                    await interaction.response.send_message(
-                        "❌ Error: Each button must be in the format `Label|URL` (pairs separated by commas).",
-                        ephemeral=True,
-                    )
+                    await interaction.response.send_message("❌ Each button must be in format `Label|URL`.", ephemeral=True)
                     return
                 label, url = pair.split("|", 1)
                 label = label.strip()
                 url = url.strip()
-                if not label:
-                    await interaction.response.send_message("❌ Error: Button label cannot be empty.", ephemeral=True)
+                if not label or not url:
+                    await interaction.response.send_message("❌ Button label and URL cannot be empty.", ephemeral=True)
                     return
                 if not url.lower().startswith(("http://", "https://")):
-                    await interaction.response.send_message(
-                        f"❌ Error: Invalid URL for button `{label}`. URLs must start with http:// or https://", ephemeral=True
-                    )
+                    await interaction.response.send_message(f"❌ Invalid URL for `{label}`. Must start with http(s).", ephemeral=True)
                     return
-                # Add a Link button
                 view.add_item(ui.Button(label=label, url=url))
 
-        # --- 3. Send embed to the channel ---
         try:
             await interaction.channel.send(embed=embed, view=view if len(view.children) > 0 else None)
         except discord.Forbidden:
-            # If we can't send in the target channel, inform the user
             try:
-                await interaction.response.send_message(
-                    "I do not have permission to post messages in that channel.", ephemeral=True
-                )
+                await interaction.response.send_message("I do not have permission to post in that channel.", ephemeral=True)
             except Exception:
-                logger.exception("Failed to send permission error after failing to post message")
+                logger.exception("Failed to send permission error")
             return
-        except Exception as e:
-            logger.exception("Failed to send custom post to channel")
+        except Exception:
+            logger.exception("Failed to send custom post")
             try:
-                await interaction.response.send_message(f"Failed to post message: {e}", ephemeral=True)
+                await interaction.response.send_message("Failed to post message due to an unexpected error.", ephemeral=True)
             except Exception:
-                logger.exception("Failed to send followup error for post_message")
+                logger.exception("Failed to acknowledge modal failure")
             return
 
-        # --- 4. Acknowledge the user (Success or Success with Warning) ---
+        ack = "✅ Your custom message has been posted!"
+        if color_warning:
+            ack += f"\n{color_warning}"
         try:
-            acknowledgement = "✅ Your custom message has been posted!"
-            if color_warning:
-                acknowledgement = f"{acknowledgement}\n{color_warning}"
-                
-            await interaction.response.send_message(acknowledgement, ephemeral=True)
+            await interaction.response.send_message(ack, ephemeral=True)
         except Exception:
             logger.exception("Failed to acknowledge modal submit")
 
 
-# --- Dynamic Interactive Button System ---
-
+# --- 3) Interactive Button Handler (placeholder + dynamic instances) ---
 class InteractiveButtonView(ui.View):
-    """
-    A persistent view that handles dynamic button clicks for actions like 
-    assigning roles or opening the ticket modal, based on the custom_id.
-    """
+    """Placeholder persistent view for interactive actions. Sent/registered dynamic views also work."""
+
     def __init__(self):
         super().__init__(timeout=None)
 
-    # Use a placeholder button definition to ensure the view registers for persistence
-    # The actual posted button will have a different custom_id, but the handler catches it.
     @ui.button(label="Action Button", style=discord.ButtonStyle.secondary, custom_id="INTERACTIVE_ACTION_PLACEHOLDER")
     async def handle_dynamic_action(self, interaction: discord.Interaction, button: ui.Button):
+        # button.custom_id will be set to the actual custom_id on the sent view instance
         parts = button.custom_id.split(":")
-        
         if len(parts) < 3 or parts[0] != "INTERACTIVE_ACTION":
             return await interaction.response.send_message("Error: Invalid button configuration.", ephemeral=True)
 
         action_type = parts[1]
-        target_value = ":".join(parts[2:]) # Handles role names that might contain ':'
-        
+        target_value = ":".join(parts[2:])
+
         if action_type == "TICKET":
-            # Respond immediately with the modal (no defer)
             try:
                 category_id = int(target_value)
             except ValueError:
                 return await interaction.response.send_message("Error: Ticket category ID is invalid.", ephemeral=True)
-                 
             try:
-                # Respond directly with the modal
                 return await interaction.response.send_modal(TicketModal(category_id=category_id))
             except Exception:
                 logger.exception("Failed to open TicketModal from dynamic button")
                 return await interaction.response.send_message("Failed to open ticket creation form.", ephemeral=True)
 
-        # For all other actions (like ROLE), defer first as they require more time
+        # ROLE or others
         await interaction.response.defer(ephemeral=True)
-
         if interaction.guild is None:
-            await interaction.followup.send("This action can only be used in a server.", ephemeral=True)
+            await interaction.followup.send("This action can only be used inside a server.", ephemeral=True)
             return
 
         if action_type == "ROLE":
             role_name = target_value
             role = discord.utils.get(interaction.guild.roles, name=role_name)
             member = interaction.user
-            
             if role is None:
-                return await interaction.followup.send(f"Error: Role `{role_name}` not found. Contact an admin.", ephemeral=True)
+                return await interaction.followup.send(f"Error: Role `{role_name}` not found.", ephemeral=True)
 
             if not isinstance(member, discord.Member):
-                # Ensure we have a Member object
                 member = interaction.guild.get_member(interaction.user.id)
                 if member is None:
                     return await interaction.followup.send("Could not resolve your member object.", ephemeral=True)
@@ -376,58 +283,42 @@ class InteractiveButtonView(ui.View):
 
             me = interaction.guild.me
             if role.position >= me.top_role.position or not me.guild_permissions.manage_roles:
-                return await interaction.followup.send(
-                    "The bot cannot assign that role due to permission hierarchy.", ephemeral=True
-                )
+                return await interaction.followup.send("The bot cannot assign that role due to permission hierarchy.", ephemeral=True)
 
             try:
                 await member.add_roles(role, reason="Dynamic role button click")
-                await interaction.followup.send(
-                    f"You have been granted the **{role_name}** role! 🎉", ephemeral=True
-                )
+                await interaction.followup.send(f"You have been granted the **{role_name}** role! 🎉", ephemeral=True)
             except Exception:
                 logger.exception("Failed to assign role from dynamic button")
                 await interaction.followup.send("Failed to assign role due to an unexpected error.", ephemeral=True)
-        
         else:
             await interaction.followup.send("Error: Unknown button action type.", ephemeral=True)
 
 
-# --- Ticketing System Components ---
-
-# 1. Custom View for closing a ticket
+# --- 4) Ticketing components ---
 class TicketCloseView(ui.View):
-    """A view with a button to close the ticket channel."""
-
     def __init__(self, ticket_opener: discord.Member):
         super().__init__(timeout=None)
-        # Store the original user who opened the ticket
         self.ticket_opener_id = ticket_opener.id
 
     @ui.button(label="Close Ticket", style=discord.ButtonStyle.red, custom_id="close_ticket_button")
     async def close_button_callback(self, interaction: discord.Interaction, button: ui.Button):
         member = interaction.user
-        # Check if the user is the ticket opener OR a user with Manage Channels permission
         can_close = (member.id == self.ticket_opener_id) or (
             isinstance(member, discord.Member) and member.guild_permissions.manage_channels
         )
-
         if not can_close:
             await interaction.response.send_message("Only the staff or the ticket creator can close this ticket.", ephemeral=True)
             return
 
-        # Inform, wait shortly, then attempt to delete the channel
         try:
-            # Use respond_with_message if interaction has not been responded to
             if interaction.response.is_done():
-                 await interaction.followup.send("Ticket closing in 5 seconds...", ephemeral=True)
+                await interaction.followup.send("Ticket closing in 5 seconds...", ephemeral=True)
             else:
-                 await interaction.response.send_message("Ticket closing in 5 seconds...", ephemeral=True)
+                await interaction.response.send_message("Ticket closing in 5 seconds...", ephemeral=True)
         except Exception:
-            # If we can't send ephemeral response (e.g., interaction already responded), continue to delete
-            logger.debug("Could not send ephemeral confirmation for ticket close; continuing.")
+            logger.debug("Could not send ephemeral confirmation; continuing to close")
 
-        # Sleep briefly to allow the user to see the message
         await asyncio.sleep(5)
 
         if interaction.channel is None:
@@ -435,12 +326,10 @@ class TicketCloseView(ui.View):
             return
 
         try:
-            # Use interaction.channel.delete for the channel the button is in
             await interaction.channel.delete(reason=f"Ticket closed by {getattr(member, 'display_name', str(member))}")
         except discord.Forbidden:
             logger.exception("Missing permission to delete ticket channel")
             try:
-                # Try to inform in guild (best-effort)
                 await interaction.followup.send("I don't have permission to delete the ticket channel. Ask an admin to remove it.", ephemeral=True)
             except Exception:
                 logger.exception("Failed to send followup after Forbidden on channel.delete")
@@ -448,10 +337,7 @@ class TicketCloseView(ui.View):
             logger.exception("Failed to delete ticket channel")
 
 
-# 2. Modal for collecting ticket reason
 class TicketModal(ui.Modal, title="Open a New Support Ticket"):
-    """Modal that collects the reason for opening the ticket."""
-
     ticket_reason = ui.TextInput(
         label="Reason for the ticket",
         style=discord.TextStyle.long,
@@ -462,67 +348,45 @@ class TicketModal(ui.Modal, title="Open a New Support Ticket"):
 
     def __init__(self, category_id: int):
         super().__init__()
-        # Category ID is passed from the button interaction handler
-        self.category_id = category_id 
+        self.category_id = category_id
 
     async def on_submit(self, interaction: discord.Interaction):
-        # Initial response to prevent "Interaction Failed"
         await interaction.response.defer(ephemeral=True)
-
         guild = interaction.guild
         member = interaction.user
-
         if guild is None or not isinstance(member, discord.Member):
             await interaction.followup.send("This action can only be performed in a server.", ephemeral=True)
             return
 
-        # Check for existing open tickets from the user (optional but recommended)
-        # We assume ticket channel names start with 'ticket-'
-        # Sanitize member name for channel name creation
-        sanitized_name = member.name.lower().replace(' ', '-').replace('_', '-').strip()
+        sanitized_name = member.name.lower().replace(" ", "-").replace("_", "-").strip()
         ticket_prefix = f"ticket-{sanitized_name}"
-        
-        # Check all channels in the guild for existing tickets
-        existing_tickets = [
-            c for c in guild.text_channels if c.name.startswith(ticket_prefix)
-        ]
+        existing_tickets = [c for c in guild.text_channels if c.name.startswith(ticket_prefix)]
         if existing_tickets:
             try:
-                await interaction.followup.send(
-                    f"You already have an open ticket: {existing_tickets[0].mention}", ephemeral=True
-                )
+                await interaction.followup.send(f"You already have an open ticket: {existing_tickets[0].mention}", ephemeral=True)
             except Exception:
                 logger.exception("Failed to notify user about existing ticket")
             return
 
-        # 1. Find the target category
         category = discord.utils.get(guild.categories, id=self.category_id)
         if category is None:
-            await interaction.followup.send(
-                f"Error: The ticket category (ID: `{self.category_id}`) does not exist or has been deleted.",
-                ephemeral=True,
-            )
+            await interaction.followup.send(f"Error: The ticket category (ID: `{self.category_id}`) does not exist.", ephemeral=True)
             return
 
-        # 2. Define permissions: Deny view for everyone, but allow staff/bot/opener
         overwrites = {
-            guild.default_role: discord.PermissionOverwrite(view_channel=False),  # Hide for everyone
-            member: discord.PermissionOverwrite(view_channel=True, send_messages=True),  # Allow opener
-            guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True),  # Allow bot
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            member: discord.PermissionOverwrite(view_channel=True, send_messages=True),
+            guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True),
         }
 
-        # OPTIONAL: Add a staff role (if present)
-        staff_role = discord.utils.get(guild.roles, name="Staff")  # Replace 'Staff' with your staff role name if different
+        staff_role = discord.utils.get(guild.roles, name="Staff")
         if staff_role:
             overwrites[staff_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
 
-        # 3. Create the ticket channel
         try:
             random_suffix = secrets.token_hex(4)
-            # Limit length to 100 (Discord channel name length cap is 100)
             base_name = f"ticket-{sanitized_name}-{random_suffix}"
             channel_name = base_name[:100]
-
             ticket_channel = await guild.create_text_channel(
                 name=channel_name,
                 category=category,
@@ -531,34 +395,24 @@ class TicketModal(ui.Modal, title="Open a New Support Ticket"):
                 reason="New support ticket creation"
             )
         except discord.Forbidden:
-            await interaction.followup.send(
-                "I do not have the required permissions to create channels or set permissions in that category.", ephemeral=True
-            )
+            await interaction.followup.send("I do not have permissions to create channels in that category.", ephemeral=True)
             return
-        except Exception as e:
+        except Exception:
             logger.exception("Failed to create ticket channel")
-            await interaction.followup.send(f"An error occurred while creating the ticket: {e}", ephemeral=True)
+            await interaction.followup.send("An error occurred while creating the ticket.", ephemeral=True)
             return
 
-        # 4. Send the initial message and follow up to the user
         ticket_embed = discord.Embed(
             title=f"Support Ticket for {member.display_name}",
-            description=f"**Reason:** {self.ticket_reason.value}\n\nOur support team will be with you shortly. Please provide any necessary details or screenshots here.",
+            description=f"**Reason:** {self.ticket_reason.value}\n\nOur support team will be with you shortly.",
             color=discord.Color.gold(),
         )
         ticket_embed.set_footer(text="Click the button below to close this ticket once your issue is resolved.")
 
-        # Mention the ticket opener and optionally a staff role
-        staff_ping = ""
-        if staff_role:
-            staff_ping = staff_role.mention + ", "
+        staff_ping = staff_role.mention + ", " if staff_role else ""
 
         try:
-            await ticket_channel.send(
-                content=f"{member.mention} {staff_ping}A new ticket has been opened.",
-                embed=ticket_embed,
-                view=TicketCloseView(ticket_opener=member)
-            )
+            await ticket_channel.send(content=f"{member.mention} {staff_ping}A new ticket has been opened.", embed=ticket_embed, view=TicketCloseView(ticket_opener=member))
         except Exception:
             logger.exception("Failed to send initial message in ticket channel")
 
@@ -568,37 +422,23 @@ class TicketModal(ui.Modal, title="Open a New Support Ticket"):
             logger.exception("Failed to send followup confirming ticket creation")
 
 
-# 3. View with the button to open the modal (The key to persistence fix)
 class TicketPanelView(ui.View):
-    """
-    A base persistent view that handles the ticket button click. 
-    It parses the category_id directly from the button's custom_id.
-    """
+    """Base persistent view that handles a dynamic TICKET_CREATE:{category_id} custom_id."""
 
-    # We must not pass arguments to __init__ for persistence to work correctly.
     def __init__(self):
         super().__init__(timeout=None)
 
-    # Use a custom_id prefix and let the setup command set the full, unique custom_id
     @ui.button(label="Create a Ticket", style=discord.ButtonStyle.primary, custom_id="TICKET_CREATE_PLACEHOLDER")
     async def create_ticket_callback(self, interaction: discord.Interaction, button: ui.Button):
-        # The custom_id is expected to be formatted as 'TICKET_CREATE:{category_id}'
-        
         if not button.custom_id.startswith("TICKET_CREATE:"):
-             await interaction.response.send_message("Internal error: Custom ID format incorrect.", ephemeral=True)
-             return
-             
-        # Extract the category_id from the dynamic custom_id
+            await interaction.response.send_message("Internal error: Custom ID format incorrect.", ephemeral=True)
+            return
         try:
             category_id = int(button.custom_id.split(":", 1)[1])
         except (ValueError, IndexError):
             logger.error(f"Failed to parse category_id from custom_id: {button.custom_id}")
-            await interaction.response.send_message(
-                "Configuration error: Cannot resolve ticket destination category.", ephemeral=True
-            )
+            await interaction.response.send_message("Configuration error: Cannot resolve ticket destination category.", ephemeral=True)
             return
-            
-        # Open the modal, passing the parsed category ID
         try:
             await interaction.response.send_modal(TicketModal(category_id=category_id))
         except Exception:
@@ -609,89 +449,75 @@ class TicketPanelView(ui.View):
                 logger.exception("Failed to send modal error response")
 
 
-# --- 3. Bot Events & Setup ---
-
-
+# --- 5) Bot lifecycle: on_ready and registration logic ---
 @bot.event
 async def on_ready():
     logger.info(f"Logged in as {bot.user} (id: {bot.user.id})")
 
-    # Register persistent views
-    # VerificationView uses a static custom_id, so one instance is enough.
-    bot.add_view(VerificationView())
-    # Register the dynamic interactive button handler placeholder
-    bot.add_view(InteractiveButtonView())
-
-    # Re-register ticket panel views from saved config so TICKET_CREATE:{category_id} custom_ids are handled after restarts
+    # Register fixed/persistent views
     try:
-        config = load_ticket_config()  # {guild_id_str: category_id}
+        bot.add_view(VerificationView())  # static custom_id -> works across restarts while process runs
+        bot.add_view(InteractiveButtonView())  # placeholder handler for dynamic interactive buttons
+    except Exception:
+        logger.exception("Failed to register base persistent views")
+
+    # Re-register ticket panel views from persisted config
+    try:
+        config = load_ticket_config()  # { "<guild_id>": <category_id> }
         for guild_id_str, category_id in config.items():
             try:
+                # create view instance for this persisted category and set the correct custom_id
                 view = TicketPanelView()
                 if len(view.children) > 0:
-                    view.children[0].custom_id = f"TICKET_CREATE:{category_id}"
+                    view.children[0].custom_id = f"TICKET_CREATE:{int(category_id)}"
                     bot.add_view(view)
                     logger.info(f"Re-registered TicketPanelView for guild {guild_id_str} -> category {category_id}")
                 else:
-                    logger.warning("TicketPanelView had no children when trying to re-register")
+                    logger.warning("TicketPanelView had no children when re-registering")
             except Exception:
                 logger.exception("Failed to re-register TicketPanelView for guild %s", guild_id_str)
     except Exception:
         logger.exception("Failed to load or re-register ticket panel views from config")
 
-    # Global sync for all commands (this is slow, but necessary for first time global deployment)
+    # Try syncing commands (best effort)
     try:
         synced = await bot.tree.sync()
-        logger.info(f"Synced {len(synced)} global command(s)")
+        logger.info(f"Synced {len(synced)} commands")
     except Exception:
-        logger.exception("Failed to sync commands globally on startup")
+        logger.exception("Failed to sync application commands on startup")
 
 
-# --- 4. Slash Commands (Verification, Custom Post, and Ticketing Setup) ---
-
-
+# --- 6) Slash commands: setup and utilities ---
 @bot.tree.command(name="setup_verify", description="Posts the verification message with a button.")
 @commands.has_permissions(administrator=True)
 async def setup_verify(interaction: discord.Interaction):
-    """Command for admins to post a verification embed with a persistent button."""
     if interaction.guild is None:
         await interaction.response.send_message("This command can only be used inside a server.", ephemeral=True)
         return
 
-    embed = discord.Embed(
-        title="Server Verification",
-        description="Click the **Verify Me** button below to gain full access to the server channels.",
-        color=discord.Color.green(),
-    )
-    embed.set_footer(text="Read the rules first!")
-
-    # Send the embed with a fresh view instance (persistent custom_id ensures the button remains functional)
+    embed = discord.Embed(title="Server Verification", description="Click the **Verify Me** button to gain access.", color=discord.Color.green())
+    embed.set_footer(text="Read the rules first.")
     try:
         view = VerificationView()
-        # register the view instance to ensure interaction handling for this run
         bot.add_view(view)
         await interaction.response.send_message(embed=embed, view=view)
     except discord.Forbidden:
-        await interaction.response.send_message(
-            "I do not have permission to send messages in this channel.", ephemeral=True
-        )
+        await interaction.response.send_message("I do not have permission to send messages in this channel.", ephemeral=True)
 
 
-@bot.tree.command(name="post_message", description="Posts a custom embed and optional link buttons (Auto-fills content).")
+@bot.tree.command(name="post_message", description="Posts a custom embed and optional link buttons.")
 @commands.has_permissions(manage_messages=True)
 async def post_message_command(interaction: discord.Interaction):
-    """Opens a modal asking for embed/message details and optional buttons."""
     try:
         await interaction.response.send_modal(PostMessageModal())
     except Exception:
-        logger.exception("Failed to open modal")
+        logger.exception("Failed to open PostMessageModal")
         try:
-            await interaction.response.send_message(f"Could not open the modal.", ephemeral=True)
+            await interaction.response.send_message("Could not open the modal.", ephemeral=True)
         except Exception:
             logger.exception("Failed to send modal error response")
 
 
-# ADDED: New command for dynamic, interactive buttons
 @bot.tree.command(name="setup_interactive_button", description="Posts a message with a custom button for roles or tickets.")
 @app_commands.describe(
     action="The action this button should perform (role or ticket).",
@@ -703,21 +529,38 @@ async def post_message_command(interaction: discord.Interaction):
 @commands.has_permissions(administrator=True)
 async def setup_interactive_button(
     interaction: discord.Interaction,
-    action: str, 
+    action: str,
     label: str,
     role_name: Optional[str] = None,
     ticket_category: Optional[discord.CategoryChannel] = None,
     message_content: Optional[str] = None,
 ):
-    """Command for admins to post a message with a custom button that assigns a role or creates a ticket."""
     if interaction.guild is None:
         await interaction.response.send_message("This command can only be used inside a server.", ephemeral=True)
         return
-        
+
     action = action.lower()
+
+    # Helpful guidance if ticket action missing category
+    if action == "ticket" and ticket_category is None:
+        example = '/setup_interactive_button action:ticket label:"Open Ticket" ticket_category:#Support message_content:"Click to open a private ticket."'
+        help_msg = (
+            "❌ When action is `ticket`, the `ticket_category` argument is required.\n\n"
+            "How to fix:\n"
+            "1. Type `/setup_interactive_button` in chat.\n"
+            "2. Set `action` to `ticket`.\n"
+            "3. Click the **ticket_category** field and select the Category from the dropdown (e.g., `Support`).\n"
+            "4. Fill `label` and optional `message_content`, then send.\n\n"
+            f"Example (fill these in the slash UI):\n{example}"
+        )
+        await interaction.response.send_message(help_msg, ephemeral=True)
+        return
+
     custom_id = None
     target_info = ""
-    
+    style = discord.ButtonStyle.secondary
+    embed_title = "Interactive Button"
+
     if action == "role":
         if not role_name:
             await interaction.response.send_message("❌ When action is `role`, the `role_name` argument is required.", ephemeral=True)
@@ -726,74 +569,49 @@ async def setup_interactive_button(
         if role is None:
             await interaction.response.send_message(f"❌ Role named `{role_name}` not found in this server.", ephemeral=True)
             return
-        # Custom ID format: INTERACTIVE_ACTION:ROLE:Role Name
         custom_id = f"INTERACTIVE_ACTION:ROLE:{role_name}"
         target_info = f"Role: {role_name}"
         style = discord.ButtonStyle.green
         embed_title = "Dynamic Role Assignment"
 
     elif action == "ticket":
-        if not ticket_category:
-            await interaction.response.send_message("❌ When action is `ticket`, the `ticket_category` argument is required.", ephemeral=True)
-            return
-        
         me = interaction.guild.me
         if not me:
             await interaction.response.send_message("Bot member object unavailable.", ephemeral=True)
             return
         category_perms = ticket_category.permissions_for(me)
         if not category_perms.manage_channels:
-            await interaction.response.send_message(
-                "❌ I must have the **Manage Channels** permission in that category to create tickets there.", ephemeral=True
-            )
+            await interaction.response.send_message("❌ I must have Manage Channels permission in that category to create tickets.", ephemeral=True)
             return
-            
-        # Custom ID format: INTERACTIVE_ACTION:TICKET:Category ID
         custom_id = f"INTERACTIVE_ACTION:TICKET:{ticket_category.id}"
         target_info = f"Category: #{ticket_category.name}"
         style = discord.ButtonStyle.primary
         embed_title = "Dynamic Ticket System"
 
     else:
-        await interaction.response.send_message("❌ Invalid action type. Must be `role` or `ticket`.", ephemeral=True)
+        await interaction.response.send_message("❌ Invalid action. Must be `role` or `ticket`.", ephemeral=True)
         return
 
-    # Create the view instance with the dynamic custom_id on its button
     view = ui.View(timeout=None)
     action_button = ui.Button(label=label, style=style, custom_id=custom_id)
     view.add_item(action_button)
-    
-    content = message_content or (
-        f"Click the **{label}** button below to complete the action. This button performs: {action.capitalize()}."
-    )
-    
-    embed = discord.Embed(
-        title=embed_title,
-        description=content,
-        color=style.color if hasattr(style, "color") else discord.Color.blurple(),
-    )
+    content = message_content or f"Click the **{label}** button below to complete the action: {action.capitalize()}."
+    embed = discord.Embed(title=embed_title, description=content, color=discord.Color.blurple())
     embed.set_footer(text=f"Action: {action.capitalize()} | Target: {target_info}")
 
-    # Register this exact view instance so button interactions are handled at runtime
+    # Register this exact view instance for this run so interactions are routed to it
     bot.add_view(view)
 
     try:
         await interaction.response.send_message(embed=embed, view=view)
     except discord.Forbidden:
-        await interaction.response.send_message(
-            "I do not have permission to send messages in this channel.", ephemeral=True
-        )
-
-    # NOTE: This view is registered for this run only. To persist across restarts, save the mapping:
-    # e.g., write to a JSON file: { "guild_id": [ { "custom_id": custom_id, "message_id": sent_msg.id } ] }
-    # and re-create & bot.add_view(...) for each saved entry inside on_ready().
+        await interaction.response.send_message("I do not have permission to send messages in this channel.", ephemeral=True)
 
 
 @bot.tree.command(name="setup_ticket", description="Posts the ticket creation panel.")
 @app_commands.describe(category="The category where new tickets should be created.")
 @commands.has_permissions(administrator=True)
 async def setup_ticket(interaction: discord.Interaction, category: discord.CategoryChannel):
-    """Command for admins to post a ticket creation embed with a persistent button."""
     if interaction.guild is None:
         await interaction.response.send_message("This command can only be used inside a server.", ephemeral=True)
         return
@@ -803,20 +621,13 @@ async def setup_ticket(interaction: discord.Interaction, category: discord.Categ
         await interaction.response.send_message("Bot member object unavailable.", ephemeral=True)
         return
 
-    # Check bot guild-level perms for creating/managing channels
     if not me.guild_permissions.manage_channels:
-        await interaction.response.send_message(
-            "I must have the **Manage Channels** permission in the server to create tickets.", ephemeral=True
-        )
+        await interaction.response.send_message("I must have Manage Channels permission in the server to create tickets.", ephemeral=True)
         return
 
-    # Check category-specific permissions
     category_perms = category.permissions_for(me)
-    # It's hard to perfectly validate every permission combination; ensure bot can create channels and manage perms
     if not category_perms.manage_channels:
-        await interaction.response.send_message(
-            "I must have sufficient permissions in that category to create channels there (Manage Channels).", ephemeral=True
-        )
+        await interaction.response.send_message("I must have Manage Channels permission in that category to create tickets.", ephemeral=True)
         return
 
     embed = discord.Embed(
@@ -825,70 +636,53 @@ async def setup_ticket(interaction: discord.Interaction, category: discord.Categ
         color=discord.Color.blue(),
     )
     embed.set_footer(text="Please be patient; we'll respond as soon as possible.")
-    
-    # Instantiate the view and set the dynamic custom_id on the actual instance we will send
-    view = TicketPanelView()
-    ticket_button = view.children[0]
-    unique_custom_id = f"TICKET_CREATE:{category.id}"
-    ticket_button.custom_id = unique_custom_id
 
-    # IMPORTANT: Register this exact view instance with the bot so interactions for this custom_id are handled
+    # Instantiate view, set dynamic custom_id, register view so interactions for this custom_id are handled
+    view = TicketPanelView()
+    if len(view.children) == 0:
+        await interaction.response.send_message("Internal error: ticket view not configured correctly.", ephemeral=True)
+        return
+
+    unique_custom_id = f"TICKET_CREATE:{category.id}"
+    view.children[0].custom_id = unique_custom_id
     bot.add_view(view)
 
     try:
         await interaction.response.send_message(embed=embed, view=view)
     except discord.Forbidden:
-        await interaction.response.send_message(
-            "I do not have permission to send messages in this channel.", ephemeral=True
-        )
+        await interaction.response.send_message("I do not have permission to send messages in this channel.", ephemeral=True)
         return
 
-    # Persist the mapping so we can re-register on startup
+    # Persist mapping so we can re-register the view on restart
     config = load_ticket_config()
     config[str(interaction.guild.id)] = category.id
     save_ticket_config(config)
     logger.info(f"Saved ticket panel category {category.id} for guild {interaction.guild.id}")
 
 
-# --- Immediate Sync Command ---
 @bot.tree.command(name="sync", description="Instantly syncs all application commands for this guild.")
 @commands.has_permissions(administrator=True)
 async def sync_commands(interaction: discord.Interaction):
-    """Admin command to force a guild-specific synchronization of slash commands."""
     if interaction.guild is None:
         await interaction.response.send_message("This command must be run inside a guild.", ephemeral=True)
         return
-        
     await interaction.response.defer(ephemeral=True)
-
     try:
-        # Perform a guild-specific sync for instant updates
-        bot.tree.clear_commands(guild=interaction.guild) # Clear current guild commands
+        bot.tree.clear_commands(guild=interaction.guild)
         synced = await bot.tree.sync(guild=interaction.guild)
-        
-        # Also attempt a global sync (best effort, but still slow)
-        await bot.tree.sync()
-        
-        await interaction.followup.send(
-            f"✅ Successfully synced **{len(synced)}** commands to this guild immediately. Global sync also attempted.",
-            ephemeral=True
-        )
+        await bot.tree.sync()  # best-effort global
+        await interaction.followup.send(f"✅ Successfully synced **{len(synced)}** commands to this guild.", ephemeral=True)
     except Exception as e:
-        logger.exception("Failed to sync commands via /sync command")
+        logger.exception("Failed to sync commands via /sync")
         await interaction.followup.send(f"❌ Command synchronization failed: {e}", ephemeral=True)
 
 
-# --- 5. Error Handling & Start ---
-
-
+# --- Error handling for app commands ---
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    # Permission errors
     if isinstance(error, app_commands.MissingPermissions):
         try:
-            await interaction.response.send_message(
-                "You do not have the required permissions to use this command.", ephemeral=True
-            )
+            await interaction.response.send_message("You do not have the required permissions to use this command.", ephemeral=True)
         except Exception:
             try:
                 await interaction.followup.send("You do not have the required permissions to use this command.", ephemeral=True)
@@ -896,23 +690,20 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
                 logger.exception("Failed to notify about missing permissions")
         return
 
-    # Generic handler
     logger.exception("App command error")
     try:
-        # Check if a response has already been sent (e.g., by the modal error handler)
         if interaction.response.is_done():
-            # If done, follow up instead
             await interaction.followup.send(f"An unexpected error occurred: {error}", ephemeral=True)
         else:
             await interaction.response.send_message(f"An unexpected error occurred: {error}", ephemeral=True)
     except Exception:
-        # If the interaction response is already done or closed
         logger.exception("Failed to respond to interaction error")
 
 
+# --- Entrypoint ---
 if __name__ == "__main__":
-    if BOT_TOKEN == "YOUR_BOT_TOKEN" or not BOT_TOKEN:
-        logger.error("Please set the DISCORD_BOT_TOKEN environment variable (or update BOT_TOKEN).")
-        print("\nERROR: Please set 'DISCORD_BOT_TOKEN' in your environment (or on Railway) before running.\n")
+    if not BOT_TOKEN:
+        logger.error("Please set the DISCORD_BOT_TOKEN environment variable.")
+        print("\nERROR: Please set 'DISCORD_BOT_TOKEN' in your environment (Railway -> Variables).\n")
     else:
         bot.run(BOT_TOKEN)
