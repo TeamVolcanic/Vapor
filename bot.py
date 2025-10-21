@@ -32,6 +32,7 @@ def load_ticket_config():
         return {}
     try:
         with open(TICKET_CONFIG_FILE, "r", encoding="utf-8") as f:
+            # Keys in JSON will be strings, so we ensure they are parsed as such
             return json.load(f)
     except Exception:
         logger.exception("Failed to load ticket config file")
@@ -52,6 +53,7 @@ def save_ticket_config(config: dict):
 class VerificationView(ui.View):
     """A persistent view with a Verify button that adds a role to the clicking user."""
 
+    # Note: custom_id is static, so one instance registration is enough for persistence.
     def __init__(self, verified_role_name: str = "Verified"):
         super().__init__(timeout=None)
         self.verified_role_name = verified_role_name
@@ -262,7 +264,11 @@ class TicketCloseView(ui.View):
 
         # Inform, wait shortly, then attempt to delete the channel
         try:
-            await interaction.response.send_message("Ticket closing in 5 seconds...", ephemeral=True)
+            # Use respond_with_message if interaction has not been responded to
+            if interaction.response.is_done():
+                 await interaction.followup.send("Ticket closing in 5 seconds...", ephemeral=True)
+            else:
+                 await interaction.response.send_message("Ticket closing in 5 seconds...", ephemeral=True)
         except Exception:
             # If we can't send ephemeral response (e.g., interaction already responded), continue to delete
             logger.debug("Could not send ephemeral confirmation for ticket close; continuing.")
@@ -275,6 +281,7 @@ class TicketCloseView(ui.View):
             return
 
         try:
+            # Use interaction.channel.delete for the channel the button is in
             await interaction.channel.delete(reason=f"Ticket closed by {getattr(member, 'display_name', str(member))}")
         except discord.Forbidden:
             logger.exception("Missing permission to delete ticket channel")
@@ -301,7 +308,8 @@ class TicketModal(ui.Modal, title="Open a New Support Ticket"):
 
     def __init__(self, category_id: int):
         super().__init__()
-        self.category_id = category_id
+        # Category ID is passed from the button interaction handler
+        self.category_id = category_id 
 
     async def on_submit(self, interaction: discord.Interaction):
         # Initial response to prevent "Interaction Failed"
@@ -316,7 +324,11 @@ class TicketModal(ui.Modal, title="Open a New Support Ticket"):
 
         # Check for existing open tickets from the user (optional but recommended)
         # We assume ticket channel names start with 'ticket-'
-        ticket_prefix = f"ticket-{member.name.lower().replace(' ', '-')}"
+        # Sanitize member name for channel name creation
+        sanitized_name = member.name.lower().replace(' ', '-').replace('_', '-').strip()
+        ticket_prefix = f"ticket-{sanitized_name}"
+        
+        # Check all channels in the guild for existing tickets
         existing_tickets = [
             c for c in guild.text_channels if c.name.startswith(ticket_prefix)
         ]
@@ -354,7 +366,7 @@ class TicketModal(ui.Modal, title="Open a New Support Ticket"):
         try:
             random_suffix = secrets.token_hex(4)
             # Limit length to 100 (Discord channel name length cap is 100)
-            base_name = f"ticket-{member.name.lower().replace(' ', '-')}-{random_suffix}"
+            base_name = f"ticket-{sanitized_name}-{random_suffix}"
             channel_name = base_name[:100]
 
             ticket_channel = await guild.create_text_channel(
@@ -402,20 +414,39 @@ class TicketModal(ui.Modal, title="Open a New Support Ticket"):
             logger.exception("Failed to send followup confirming ticket creation")
 
 
-# 3. View with the button to open the modal
+# 3. View with the button to open the modal (The key to persistence fix)
 class TicketPanelView(ui.View):
-    """A persistent view with a button that triggers the TicketModal."""
+    """
+    A base persistent view that handles the ticket button click. 
+    It parses the category_id directly from the button's custom_id.
+    """
 
-    def __init__(self, category_id: int):
+    # We must not pass arguments to __init__ for persistence to work correctly.
+    def __init__(self):
         super().__init__(timeout=None)
-        # This ID needs to be persistent, so we store it on the class instance
-        self.category_id = category_id
 
-    @ui.button(label="Create a Ticket", style=discord.ButtonStyle.primary, custom_id="create_ticket_button")
+    # Use a custom_id prefix and let the setup command set the full, unique custom_id
+    @ui.button(label="Create a Ticket", style=discord.ButtonStyle.primary, custom_id="TICKET_CREATE_PLACEHOLDER")
     async def create_ticket_callback(self, interaction: discord.Interaction, button: ui.Button):
-        # Open the modal, passing the category ID
+        # The custom_id is expected to be formatted as 'TICKET_CREATE:{category_id}'
+        
+        if not button.custom_id.startswith("TICKET_CREATE:"):
+             await interaction.response.send_message("Internal error: Custom ID format incorrect.", ephemeral=True)
+             return
+             
+        # Extract the category_id from the dynamic custom_id
         try:
-            await interaction.response.send_modal(TicketModal(category_id=self.category_id))
+            category_id = int(button.custom_id.split(":", 1)[1])
+        except (ValueError, IndexError):
+            logger.error(f"Failed to parse category_id from custom_id: {button.custom_id}")
+            await interaction.response.send_message(
+                "Configuration error: Cannot resolve ticket destination category.", ephemeral=True
+            )
+            return
+            
+        # Open the modal, passing the parsed category ID
+        try:
+            await interaction.response.send_modal(TicketModal(category_id=category_id))
         except Exception:
             logger.exception("Failed to open TicketModal")
             try:
@@ -432,22 +463,16 @@ async def on_ready():
     logger.info(f"Logged in as {bot.user} (id: {bot.user.id})")
 
     # Register persistent views
+    # VerificationView uses a static custom_id, so one instance is enough.
     bot.add_view(VerificationView())
-
-    # Load persisted ticket category mappings and register TicketPanelView for each valid mapping
-    ticket_config = load_ticket_config()
-    registered = 0
-    for guild_id_str, category_id in ticket_config.items():
-        try:
-            guild_id = int(guild_id_str)
-        except Exception:
-            continue
-        # Only add view to bot; the view itself is not guild-scoped in registration.
-        if category_id and isinstance(category_id, int):
-            bot.add_view(TicketPanelView(category_id=category_id))
-            registered += 1
-
-    logger.info(f"Registered {registered} persisted TicketPanelView(s) on startup.")
+    
+    # TicketPanelView uses a dynamic custom_id (TICKET_CREATE:{id}), so we register the class 
+    # to handle any button starting with the class's default custom_id prefix.
+    # The actual state (category_id) will be derived from the custom_id in the callback.
+    bot.add_view(TicketPanelView())
+    
+    # NOTE: The previous loop loading ticket_config and re-registering multiple views 
+    # for TicketPanelView has been removed, as it was the source of the conflict.
 
     # Sync global app commands (consider using guild-specific sync during development)
     try:
@@ -536,12 +561,26 @@ async def setup_ticket(interaction: discord.Interaction, category: discord.Categ
         color=discord.Color.blue(),
     )
     embed.set_footer(text="Please be patient; we'll respond as soon as possible.")
-
-    # Send the embed with the persistent view, passing the Category ID
+    
+    # --- FIX: Create a view instance and dynamically set the custom_id on the button ---
+    
+    # 1. Instantiate the view (it will have the placeholder custom_id)
+    view = TicketPanelView()
+    
+    # 2. Find the correct button in the view children (it's the only one, at index 0)
+    ticket_button = view.children[0]
+    
+    # 3. Create the unique, stateful custom_id and assign it to the button
+    # This is the crucial fix: the custom_id now holds the category_id,
+    # ensuring the correct destination is used after a bot restart.
+    unique_custom_id = f"TICKET_CREATE:{category.id}"
+    ticket_button.custom_id = unique_custom_id
+    
+    # Send the embed with the modified view instance
     try:
         await interaction.response.send_message(
             embed=embed,
-            view=TicketPanelView(category_id=category.id)
+            view=view
         )
     except discord.Forbidden:
         await interaction.response.send_message(
@@ -549,7 +588,8 @@ async def setup_ticket(interaction: discord.Interaction, category: discord.Categ
         )
         return
 
-    # Persist the mapping so the view can be re-registered after restarts
+    # Persist the mapping so the view can be re-registered after restarts (optional now, but good for admin info)
+    # The config file is now less crucial for *restarting* the button functionality, but still useful for tracking.
     config = load_ticket_config()
     config[str(interaction.guild.id)] = category.id
     save_ticket_config(config)
