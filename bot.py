@@ -619,12 +619,26 @@ async def on_ready():
     # Register persistent views
     # VerificationView uses a static custom_id, so one instance is enough.
     bot.add_view(VerificationView())
-    # TicketPanelView uses a dynamic custom_id (TICKET_CREATE:{id}), so we register the class 
-    # to handle any button starting with the class's default custom_id prefix.
-    bot.add_view(TicketPanelView())
-    # ADDED: Register the dynamic interactive button view
+    # Register the dynamic interactive button handler placeholder
     bot.add_view(InteractiveButtonView())
-    
+
+    # Re-register ticket panel views from saved config so TICKET_CREATE:{category_id} custom_ids are handled after restarts
+    try:
+        config = load_ticket_config()  # {guild_id_str: category_id}
+        for guild_id_str, category_id in config.items():
+            try:
+                view = TicketPanelView()
+                if len(view.children) > 0:
+                    view.children[0].custom_id = f"TICKET_CREATE:{category_id}"
+                    bot.add_view(view)
+                    logger.info(f"Re-registered TicketPanelView for guild {guild_id_str} -> category {category_id}")
+                else:
+                    logger.warning("TicketPanelView had no children when trying to re-register")
+            except Exception:
+                logger.exception("Failed to re-register TicketPanelView for guild %s", guild_id_str)
+    except Exception:
+        logger.exception("Failed to load or re-register ticket panel views from config")
+
     # Global sync for all commands (this is slow, but necessary for first time global deployment)
     try:
         synced = await bot.tree.sync()
@@ -653,7 +667,10 @@ async def setup_verify(interaction: discord.Interaction):
 
     # Send the embed with a fresh view instance (persistent custom_id ensures the button remains functional)
     try:
-        await interaction.response.send_message(embed=embed, view=VerificationView())
+        view = VerificationView()
+        # register the view instance to ensure interaction handling for this run
+        bot.add_view(view)
+        await interaction.response.send_message(embed=embed, view=view)
     except discord.Forbidden:
         await interaction.response.send_message(
             "I do not have permission to send messages in this channel.", ephemeral=True
@@ -720,7 +737,6 @@ async def setup_interactive_button(
             await interaction.response.send_message("❌ When action is `ticket`, the `ticket_category` argument is required.", ephemeral=True)
             return
         
-        # Check permissions for bot to create channels in that category
         me = interaction.guild.me
         if not me:
             await interaction.response.send_message("Bot member object unavailable.", ephemeral=True)
@@ -742,7 +758,7 @@ async def setup_interactive_button(
         await interaction.response.send_message("❌ Invalid action type. Must be `role` or `ticket`.", ephemeral=True)
         return
 
-    # Create a temporary view to send the message with the specific, dynamic button
+    # Create the view instance with the dynamic custom_id on its button
     view = ui.View(timeout=None)
     action_button = ui.Button(label=label, style=style, custom_id=custom_id)
     view.add_item(action_button)
@@ -754,9 +770,12 @@ async def setup_interactive_button(
     embed = discord.Embed(
         title=embed_title,
         description=content,
-        color=style.color,
+        color=style.color if hasattr(style, "color") else discord.Color.blurple(),
     )
     embed.set_footer(text=f"Action: {action.capitalize()} | Target: {target_info}")
+
+    # Register this exact view instance so button interactions are handled at runtime
+    bot.add_view(view)
 
     try:
         await interaction.response.send_message(embed=embed, view=view)
@@ -764,6 +783,10 @@ async def setup_interactive_button(
         await interaction.response.send_message(
             "I do not have permission to send messages in this channel.", ephemeral=True
         )
+
+    # NOTE: This view is registered for this run only. To persist across restarts, save the mapping:
+    # e.g., write to a JSON file: { "guild_id": [ { "custom_id": custom_id, "message_id": sent_msg.id } ] }
+    # and re-create & bot.add_view(...) for each saved entry inside on_ready().
 
 
 @bot.tree.command(name="setup_ticket", description="Posts the ticket creation panel.")
@@ -803,35 +826,29 @@ async def setup_ticket(interaction: discord.Interaction, category: discord.Categ
     )
     embed.set_footer(text="Please be patient; we'll respond as soon as possible.")
     
-    # --- FIX: Create a view instance and dynamically set the custom_id on the button ---
-    
-    # 1. Instantiate the view (it will have the placeholder custom_id)
+    # Instantiate the view and set the dynamic custom_id on the actual instance we will send
     view = TicketPanelView()
-    
-    # 2. Find the correct button in the view children (it's the only one, at index 0)
     ticket_button = view.children[0]
-    
-    # 3. Create the unique, stateful custom_id and assign it to the button
     unique_custom_id = f"TICKET_CREATE:{category.id}"
     ticket_button.custom_id = unique_custom_id
-    
-    # Send the embed with the modified view instance
+
+    # IMPORTANT: Register this exact view instance with the bot so interactions for this custom_id are handled
+    bot.add_view(view)
+
     try:
-        await interaction.response.send_message(
-            embed=embed,
-            view=view
-        )
+        await interaction.response.send_message(embed=embed, view=view)
     except discord.Forbidden:
         await interaction.response.send_message(
             "I do not have permission to send messages in this channel.", ephemeral=True
         )
         return
 
-    # Persist the mapping so the view can be re-registered after restarts (optional now, but good for admin info)
+    # Persist the mapping so we can re-register on startup
     config = load_ticket_config()
     config[str(interaction.guild.id)] = category.id
     save_ticket_config(config)
     logger.info(f"Saved ticket panel category {category.id} for guild {interaction.guild.id}")
+
 
 # --- Immediate Sync Command ---
 @bot.tree.command(name="sync", description="Instantly syncs all application commands for this guild.")
