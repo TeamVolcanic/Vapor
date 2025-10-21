@@ -239,7 +239,7 @@ class PostMessageModal(ui.Modal, title="Create Custom Post"):
             logger.exception("Failed to acknowledge modal submit")
 
 
-# --- NEW: Ticketing System Components ---
+# --- Ticketing System Components ---
 
 # 1. Custom View for closing a ticket
 class TicketCloseView(ui.View):
@@ -468,21 +468,17 @@ async def on_ready():
     
     # TicketPanelView uses a dynamic custom_id (TICKET_CREATE:{id}), so we register the class 
     # to handle any button starting with the class's default custom_id prefix.
-    # The actual state (category_id) will be derived from the custom_id in the callback.
     bot.add_view(TicketPanelView())
     
-    # NOTE: The previous loop loading ticket_config and re-registering multiple views 
-    # for TicketPanelView has been removed, as it was the source of the conflict.
-
-    # Sync global app commands (consider using guild-specific sync during development)
+    # Global sync for all commands (this is slow, but necessary for first time global deployment)
     try:
         synced = await bot.tree.sync()
-        logger.info(f"Synced {len(synced)} command(s)")
+        logger.info(f"Synced {len(synced)} global command(s)")
     except Exception:
-        logger.exception("Failed to sync commands")
+        logger.exception("Failed to sync commands globally on startup")
 
 
-# --- 4. Slash Commands (Verification & Custom Post) ---
+# --- 4. Slash Commands (Verification, Custom Post, and Ticketing Setup) ---
 
 
 @bot.tree.command(name="setup_verify", description="Posts the verification message with a button.")
@@ -522,8 +518,6 @@ async def post_message_command(interaction: discord.Interaction):
         except Exception:
             logger.exception("Failed to send modal error response")
 
-
-# --- NEW: Ticketing Slash Command ---
 
 @bot.tree.command(name="setup_ticket", description="Posts the ticket creation panel.")
 @app_commands.describe(category="The category where new tickets should be created.")
@@ -571,8 +565,6 @@ async def setup_ticket(interaction: discord.Interaction, category: discord.Categ
     ticket_button = view.children[0]
     
     # 3. Create the unique, stateful custom_id and assign it to the button
-    # This is the crucial fix: the custom_id now holds the category_id,
-    # ensuring the correct destination is used after a bot restart.
     unique_custom_id = f"TICKET_CREATE:{category.id}"
     ticket_button.custom_id = unique_custom_id
     
@@ -589,11 +581,37 @@ async def setup_ticket(interaction: discord.Interaction, category: discord.Categ
         return
 
     # Persist the mapping so the view can be re-registered after restarts (optional now, but good for admin info)
-    # The config file is now less crucial for *restarting* the button functionality, but still useful for tracking.
     config = load_ticket_config()
     config[str(interaction.guild.id)] = category.id
     save_ticket_config(config)
     logger.info(f"Saved ticket panel category {category.id} for guild {interaction.guild.id}")
+
+# --- Immediate Sync Command ---
+@bot.tree.command(name="sync", description="Instantly syncs all application commands for this guild.")
+@commands.has_permissions(administrator=True)
+async def sync_commands(interaction: discord.Interaction):
+    """Admin command to force a guild-specific synchronization of slash commands."""
+    if interaction.guild is None:
+        await interaction.response.send_message("This command must be run inside a guild.", ephemeral=True)
+        return
+        
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        # Perform a guild-specific sync for instant updates
+        bot.tree.clear_commands(guild=interaction.guild) # Clear current guild commands
+        synced = await bot.tree.sync(guild=interaction.guild)
+        
+        # Also attempt a global sync (best effort, but still slow)
+        await bot.tree.sync()
+        
+        await interaction.followup.send(
+            f"✅ Successfully synced **{len(synced)}** commands to this guild immediately. Global sync also attempted.",
+            ephemeral=True
+        )
+    except Exception as e:
+        logger.exception("Failed to sync commands via /sync command")
+        await interaction.followup.send(f"❌ Command synchronization failed: {e}", ephemeral=True)
 
 
 # --- 5. Error Handling & Start ---
