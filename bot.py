@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
 Vapor Bot - Verification Ticket System
-- Interactive buttons: verify, role, ticket
-- Verification tickets: 1-10^19 numbering
+- Verify button creates private tickets
+- Ticket numbering: 1-10^19
 - 1-minute per-user cooldown
 - Ticket owner and admins can close tickets
 - Admins can claim/close/close-with-reason
 - AI-style embeds with emojis
+- Global slash command sync
 """
 
 import asyncio
@@ -19,7 +20,6 @@ from discord.ext import commands
 from discord import app_commands, ui
 
 BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
-GUILD_ID = 123456789012345678  # Replace with your server ID
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -148,6 +148,7 @@ class TicketActionView(ui.View):
         if interaction.user != self.ticket_owner and not interaction.user.guild_permissions.administrator:
             await interaction.response.send_message("❌ Only the ticket owner or admin can close this ticket.", ephemeral=True)
             return
+
         modal = CloseReasonModal(ticket_channel=interaction.channel)
         await interaction.response.send_modal(modal)
 
@@ -165,17 +166,14 @@ class CloseReasonModal(ui.Modal, title="Close Ticket with Reason"):
         await asyncio.sleep(2)
         await self.ticket_channel.delete()
 
-# --- Setup Interactive Button Command ---
-@bot.tree.command(
-    name="setup_interactive_button",
-    description="Posts a message with a custom button for verify, role, or ticket."
-)
+# --- Setup Interactive Button Command (Old Command) ---
+@bot.tree.command(name="setup_interactive_button", description="Posts a message with a custom button for roles or tickets.")
 @app_commands.describe(
-    action="Action type: verify, role, or ticket",
-    label="Text on the button",
-    role_name="[For Role] Role to assign",
-    ticket_category="[For Ticket] Category for ticket channels",
-    message_content="Optional message above the button"
+    action="The action this button should perform (verify, role, or ticket).",
+    label="The text on the button.",
+    role_name="[For Role] The name of the role to assign.",
+    ticket_category="[For Ticket] The category where new ticket channels will be created.",
+    message_content="Optional text to display above the button."
 )
 @commands.has_permissions(administrator=True)
 async def setup_interactive_button(
@@ -192,7 +190,7 @@ async def setup_interactive_button(
 
     if action == "role":
         if not role_name:
-            await interaction.response.send_message("❌ Missing role_name.", ephemeral=True)
+            await interaction.response.send_message("❌ Missing role_name for role action.", ephemeral=True)
             return
         role = discord.utils.get(interaction.guild.roles, name=role_name)
         if not role:
@@ -213,13 +211,14 @@ async def setup_interactive_button(
         target_info = "#━━━━⮩VERIFICATION⮨━━━━"
 
     else:
-        await interaction.response.send_message("❌ Invalid action.", ephemeral=True)
+        await interaction.response.send_message("❌ Invalid action. Use `verify`, `role`, or `ticket`.", ephemeral=True)
         return
 
     view = ui.View(timeout=None)
     view.add_item(ui.Button(label=label, style=discord.ButtonStyle.primary, custom_id=custom_id))
 
     embed = generate_ai_embed(action, label, target_info)
+
     bot.add_view(view)
     await interaction.response.send_message(embed=embed, view=view)
 
@@ -228,10 +227,9 @@ async def setup_interactive_button(
 async def on_ready():
     logger.info(f"✅ Logged in as {bot.user} (id: {bot.user.id})")
     bot.add_view(VerificationView())
-    guild = discord.Object(id=GUILD_ID)
     try:
-        synced = await bot.tree.sync(guild=guild)
-        logger.info(f"Synced {len(synced)} commands to guild!")
+        synced = await bot.tree.sync()  # GLOBAL sync
+        logger.info(f"Synced {len(synced)} commands globally!")
     except Exception as e:
         logger.exception("Failed to sync commands: %s", e)
 
