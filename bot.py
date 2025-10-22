@@ -182,8 +182,15 @@ async def mverify(interaction: discord.Interaction, user: discord.Member, role: 
         pass
 
 # -------------------- REACTION ROLE --------------------
-
 @bot.tree.command(name="reactionrole")
 @app_commands.describe(emoji="Emoji to react with", role="Role to assign", prompt="Embed message")
 async def reactionrole(interaction: discord.Interaction, emoji: str, role: discord.Role, prompt: str):
-embed = discord.Embed(title=f"{emoji} {role.name} Role", description=prompt, color=discord.Color.purple())
+    embed = discord.Embed(
+        title=f"{emoji} {role.name} Role",
+        description=prompt,
+        color=discord.Color.purple()
+    )
+    msg = await interaction.channel.send(embed=embed)
+    await msg.add_reaction(emoji)
+    reaction_roles[msg.id] = {emoji: role.id}
+    await interaction.response.send_message("Reaction role message posted.", ephemeral=True)
