@@ -185,8 +185,6 @@ async def reactionrole(interaction: discord.Interaction, emoji: str, role: disco
     reaction_roles[msg.id] = {emoji: role.id}
     await interaction.response.send_message("Reaction role message posted.", ephemeral=True)
 
-@bot.event
-async def
 # -------------------- EMBED GENERATOR --------------------
 
 @bot.tree.command(name="detailmessage")
