@@ -2,7 +2,6 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 import os
-import asyncio
 from dotenv import load_dotenv
 from datetime import datetime
 
@@ -60,19 +59,16 @@ async def on_interaction(interaction: discord.Interaction):
     guild = interaction.guild
     now = datetime.utcnow()
 
-    # Cooldown check
     if user.id in cooldowns and (now - cooldowns[user.id]).total_seconds() < 60:
         await interaction.response.send_message("⏳ Please wait before opening another ticket.", ephemeral=True)
         return
     cooldowns[user.id] = now
 
-    # Ticket number
     gid = guild.id
     ticket_counter.setdefault(gid, 1)
     ticket_number = ticket_counter[gid]
     ticket_counter[gid] += 1
 
-    # Create channel
     category_name = "Tickets"
     prefix = "ticket"
     role_id = None
@@ -100,11 +96,9 @@ async def on_interaction(interaction: discord.Interaction):
     await channel.send(content=user.mention, embed=embed, view=view)
     await interaction.response.send_message(f"✅ Ticket created: {channel.mention}", ephemeral=True)
 
-    # Claim
     if interaction.data["custom_id"] == "claim_ticket":
         await interaction.response.send_message(f"🎟️ Ticket claimed by {user.mention}", ephemeral=False)
 
-    # Close ticket
     elif interaction.data["custom_id"].startswith("close_ticket"):
         role_id = interaction.data["custom_id"].split(":")[1] if ":" in interaction.data["custom_id"] else None
         role = guild.get_role(int(role_id)) if role_id else None
@@ -119,7 +113,6 @@ async def on_interaction(interaction: discord.Interaction):
         await interaction.response.send_message("🔒 Ticket closed.", ephemeral=True)
         await interaction.channel.delete()
 
-    # Close with reason
     elif interaction.data["custom_id"].startswith("close_with_reason"):
         role_id = interaction.data["custom_id"].split(":")[1] if ":" in interaction.data["custom_id"] else None
         await interaction.response.send_modal(CloseReasonModal(role_id))
@@ -182,16 +175,19 @@ async def mverify(interaction: discord.Interaction, user: discord.Member, role: 
         pass
 
 # -------------------- REACTION ROLE --------------------
+
 @bot.tree.command(name="reactionrole")
 @app_commands.describe(emoji="Emoji to react with", role="Role to assign", prompt="Embed message")
 async def reactionrole(interaction: discord.Interaction, emoji: str, role: discord.Role, prompt: str):
-    embed = discord.Embed(
-        title=f"{emoji} {role.name} Role",
-        description=prompt,
-        color=discord.Color.purple()
-    )
+    embed = discord.Embed(title=f"{emoji} {role.name} Role", description=prompt, color=discord.Color.purple())
+    msg = await interaction.channel.send(embed=embed)
+    await msg.add_reaction(emoji)
+    reaction_roles[msg.id] = {emoji: role.id}
+    await interaction.response.send_message("Reaction role message posted.", ephemeral=True)
 
-    # -------------------- EMBED GENERATOR --------------------
+@bot.event
+async def
+# -------------------- EMBED GENERATOR --------------------
 
 @bot.tree.command(name="detailmessage")
 @app_commands.describe(prompt="Message content")
@@ -213,7 +209,3 @@ if __name__ == "__main__":
         print("❌ DISCORD_TOKEN missing in .env")
     else:
         bot.run(TOKEN)
-    msg = await interaction.channel.send(embed=embed)
-    await msg.add_reaction(emoji)
-    reaction_roles[msg.id] = {emoji: role.id}
-    await interaction.response.send_message("Reaction role message posted.", ephemeral=True)
