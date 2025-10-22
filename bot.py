@@ -190,6 +190,29 @@ async def reactionrole(interaction: discord.Interaction, emoji: str, role: disco
         description=prompt,
         color=discord.Color.purple()
     )
+
+    # -------------------- EMBED GENERATOR --------------------
+
+@bot.tree.command(name="detailmessage")
+@app_commands.describe(prompt="Message content")
+async def detailmessage(interaction: discord.Interaction, prompt: str):
+    embed = discord.Embed(title="📢 Vapor Announcement", description=prompt, color=discord.Color.gold())
+    await interaction.response.send_message(embed=embed)
+
+# -------------------- BOT READY --------------------
+
+@bot.event
+async def on_ready():
+    await bot.tree.sync()
+    print(f"✅ Vapor is online as {bot.user}")
+
+# -------------------- RUN --------------------
+
+if __name__ == "__main__":
+    if not TOKEN:
+        print("❌ DISCORD_TOKEN missing in .env")
+    else:
+        bot.run(TOKEN)
     msg = await interaction.channel.send(embed=embed)
     await msg.add_reaction(emoji)
     reaction_roles[msg.id] = {emoji: role.id}
